@@ -1,0 +1,6 @@
+{
+  "name": "Flex Studio Pro 2026",
+  "description": "منصة احترافية لاستعراض وتحليل ملفات فليكس المتحركة. قم برفع ومعاينة ملفاتك بدقة عالية وأدوات تصدير متطورة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

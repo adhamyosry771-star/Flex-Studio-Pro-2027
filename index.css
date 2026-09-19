@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+html, body, #root {
+  background-color: #020617 !important;
+  background: #020617 !important;
+  color: #f8fafc;
+  min-height: 100vh;
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+body {
+  @apply bg-slate-950 text-slate-200;
+  font-family: 'Inter', sans-serif;
+}
+
+body.disable-select {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+body.allow-select,
+body.allow-select * {
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  -ms-user-select: text !important;
+  user-select: text !important;
+}
+
+input, textarea {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+}
+
+input {
+  background-color: transparent !important;
+}
+
+/* Fix for browser autofill turning background white/blue */
+input:-webkit-autofill,
+input:-webkit-autofill:hover, 
+input:-webkit-autofill:focus, 
+input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 50px rgba(255, 255, 255, 0) inset !important;
+  -webkit-text-fill-color: #ffffff !important;
+  transition: background-color 5000s ease-in-out 0s;
+  caret-color: white;
+}
+
+/* Custom scrollbar matching the website design */
+.history-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #4f46e5 rgba(15, 23, 42, 0.4);
+}
+
+.history-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  display: block;
+}
+
+.history-scrollbar::-webkit-scrollbar-track {
+  background-color: rgba(15, 23, 42, 0.4);
+  border-radius: 9999px;
+}
+
+.history-scrollbar::-webkit-scrollbar-thumb {
+  background-color: #475569;
+  border-radius: 9999px;
+}
+
+.history-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: #6366f1;
+}
+
+.history-scrollbar::-webkit-scrollbar-button {
+  display: none;
+}
+

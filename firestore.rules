@@ -1,0 +1,79 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        (request.auth.token.email == "adhamyosry56@gmail.com" || 
+         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
+    }
+
+    function isValidUser(data) {
+      return data.uid is string &&
+             data.email is string &&
+             data.role in ['admin', 'user'] &&
+             data.status in ['active', 'banned'];
+    }
+
+    function isValidCode(data) {
+      return data.code is string &&
+             data.duration in ['day', 'week', 'month', 'year'] &&
+             data.isUsed is bool;
+    }
+
+    function isValidBanner(data) {
+      return data.id is string &&
+             data.imageUrl is string &&
+             data.imageUrl.size() <= 2000;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    
+    match /users/{userId} {
+      allow get: if isAuthenticated();
+      allow list: if isAdmin();
+      allow create: if isAuthenticated() && isOwner(userId) && 
+                    isValidUser(request.resource.data) && 
+                    request.resource.data.role == (request.auth.token.email == "adhamyosry56@gmail.com" ? "admin" : "user") &&
+                    request.resource.data.status == "active";
+      allow update: if isAdmin() || (isOwner(userId) && 
+                    request.resource.data.role == resource.data.role && 
+                    request.resource.data.status == resource.data.status &&
+                    (!('subscriptionActive' in request.resource.data) || request.resource.data.subscriptionActive == resource.data.subscriptionActive || isAdmin()) &&
+                    (!('subscriptionExpires' in request.resource.data) || request.resource.data.subscriptionExpires == resource.data.subscriptionExpires || isAdmin()));
+      allow delete: if isAdmin();
+    }
+
+    match /subscriptionCodes/{codeId} {
+      allow read: if isAuthenticated();
+      allow create, delete: if isAdmin();
+      allow update: if isAuthenticated() && 
+                    isValidCode(request.resource.data) &&
+                    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isUsed', 'usedBy']);
+    }
+
+    match /appSettings/{settingId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /banners/{bannerId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidBanner(request.resource.data);
+      allow delete: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "module": "ESNext",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "skipLibCheck": true,
+    "types": [
+      "node"
+    ],
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "exclude": [
+    "components/AdminPanel.tsx",
+    "components/ArtifactCard.tsx",
+    "components/CPAdmin.tsx",
+    "components/CreateRoomModal.tsx",
+    "components/NewsPage.tsx",
+    "components/NotificationsPage.tsx",
+    "components/QuantumScene.tsx",
+    "components/RoomCard.tsx",
+    "components/SetupProfile.tsx",
+    "components/StoreModal.tsx",
+    "components/VoiceRoom.tsx",
+    "components/MessagesPage.tsx",
+    "components/SideDrawer.tsx",
+    "constants.ts"
+  ]
+}

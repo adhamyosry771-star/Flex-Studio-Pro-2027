@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and status information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "status": { "type": "string", "enum": ["active", "banned"] },
+        "banUntil": { "type": "string", "format": "date-time" },
+        "subscriptionActive": { "type": "boolean" },
+        "subscriptionExpires": { "type": "string", "format": "date-time" },
+        "lastLogin": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "status"]
+    },
+    "SubscriptionCode": {
+      "title": "Subscription Code",
+      "description": "Activation codes for subscriptions",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string" },
+        "duration": { "type": "string", "enum": ["day", "week", "month", "year"] },
+        "isUsed": { "type": "boolean" },
+        "usedBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["code", "duration", "isUsed", "createdAt"]
+    },
+    "AppSettings": {
+      "title": "App Settings",
+      "description": "Global application configuration and branding",
+      "type": "object",
+      "properties": {
+        "logoURL": { "type": "string" }
+      }
+    },
+    "PromoBanner": {
+      "title": "Promo Banner",
+      "description": "Promotional banners displayed below history logs in viewers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "imageUrl", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User documents"
+    },
+    "/subscriptionCodes/{codeId}": {
+      "schema": "SubscriptionCode",
+      "description": "Subscription activation codes"
+    },
+    "/appSettings/{settingId}": {
+      "schema": "AppSettings",
+      "description": "Global settings documents"
+    },
+    "/banners/{bannerId}": {
+      "schema": "PromoBanner",
+      "description": "Promotional banner slide documents"
+    }
+  }
+}

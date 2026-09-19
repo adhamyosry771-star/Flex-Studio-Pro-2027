@@ -1,0 +1,103 @@
+
+<!DOCTYPE html>
+<html lang="ar" style="background-color: #020617;">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Flex Studio Pro 2026</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/howler/2.2.4/howler.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip-utils/0.1.0/jszip-utils.min.js"></script>
+    <script>
+      // Fallback polyfill for JSZipUtils in case of CDN failure
+      if (typeof window !== 'undefined' && !window.JSZipUtils) {
+        window.JSZipUtils = {
+          getBinaryContent: function(path, callback) {
+            fetch(path)
+              .then(function(res) {
+                if (!res.ok) throw new Error('Failed to fetch binary ' + res.status);
+                return res.arrayBuffer();
+              })
+              .then(function(buf) {
+                callback(null, buf);
+              })
+              .catch(function(err) {
+                callback(err);
+              });
+          }
+        };
+      }
+    </script>
+    <script src="https://unpkg.com/svgaplayerweb@2.3.1/build/svga.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      html, body, #root {
+        font-family: 'Inter', sans-serif;
+        background-color: #020617 !important;
+        background: #020617 !important;
+        color: #f8fafc;
+        margin: 0;
+        min-height: 100vh;
+        overflow-x: hidden;
+      }
+      ::-webkit-scrollbar {
+        width: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1e293b;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #475569;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #64748b;
+      }
+      
+      #svga-player-container {
+        position: relative !important;
+        width: 100% !important;
+        height: 100% !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        overflow: visible !important;
+      }
+
+      #svga-player-container canvas {
+        width: 100% !important;
+        height: 100% !important;
+        max-width: 100% !important;
+        max-height: 100% !important;
+        object-fit: contain !important;
+        display: block !important;
+        margin: auto !important;
+        transform: none !important;
+        -webkit-transform: none !important;
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://esm.sh/react@^19.2.4/",
+    "react": "https://esm.sh/react@^19.2.4",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.4/",
+    "lucide-react": "https://esm.sh/lucide-react@^0.563.0",
+    "framer-motion": "https://esm.sh/framer-motion@^12.29.2",
+    "@react-three/fiber": "https://esm.sh/@react-three/fiber@^9.5.0",
+    "@react-three/drei": "https://esm.sh/@react-three/drei@^10.7.7",
+    "three": "https://esm.sh/three@^0.182.0",
+    "path": "https://esm.sh/path@^0.12.7",
+    "vite": "https://esm.sh/vite@^7.3.1",
+    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2",
+    "url": "https://esm.sh/url@^0.11.4"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body style="background-color: #020617; margin: 0; min-height: 100vh;">
+    <div id="root" style="background-color: #020617; min-height: 100vh;"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
