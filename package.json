@@ -10,6 +10,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@tailwindcss/vite": "^4.2.2",
     "apng-js": "^1.1.5",
     "firebase": "^12.12.0",

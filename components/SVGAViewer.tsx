@@ -23,8 +23,10 @@ import {
   Link,
   Unlink,
   Play,
-  Pause
+  Pause,
+  FolderArchive
 } from 'lucide-react';
+import JSZip from 'jszip';
 import pako from 'pako';
 import * as UPNG from 'upng-js';
 import { parse } from 'protobufjs';
@@ -191,7 +193,15 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportStatus, setExportStatus] = useState('');
+  const [exportTitle, setExportTitle] = useState('تصدير محتويات الملف');
   const [hiddenAssets, setHiddenAssets] = useState<Set<string>>(new Set());
+  const hiddenAssetsRef = useRef<Set<string>>(new Set());
+  const origDimensionsRef = useRef<Record<string, { width: number; height: number }>>({});
+  const TRANSPARENT_1PX = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+
+  useEffect(() => {
+    hiddenAssetsRef.current = hiddenAssets;
+  }, [hiddenAssets]);
   
   const [replacedAssetsPart1, setReplacedAssetsPart1] = useState<Record<string, string>>({});
   const [replacedAssetsPart2, setReplacedAssetsPart2] = useState<Record<string, string>>({});
@@ -225,6 +235,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     solidFill: number;
     glowColor: string;
     smartMatch: boolean;
+    fitMode?: 'cover' | 'contain' | 'stretch';
   }>>({});
 
   const [addedAssets1, setAddedAssets1] = useState<Record<string, string>>({});
@@ -270,6 +281,12 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
   }, [savedEditSettings]);
 
   const assetMediaCacheRef = useRef<Record<string, {
+    origImg: HTMLImageElement | null;
+    origSrc: string;
+    origLoaded: boolean;
+    origWidth: number;
+    origHeight: number;
+
     bgImg: HTMLImageElement | null;
     bgSrc: string;
     bgLoaded: boolean;
@@ -283,9 +300,15 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     over2Loaded: boolean;
   }>>({});
 
-  const getMediaCache = (assetId: string, bgSrc: string, over1Src: string, over2Src: string) => {
+  const getMediaCache = (assetId: string, origSrc: string, bgSrc: string, over1Src: string, over2Src: string) => {
     if (!assetMediaCacheRef.current[assetId]) {
       assetMediaCacheRef.current[assetId] = {
+        origImg: null,
+        origSrc: '',
+        origLoaded: false,
+        origWidth: 0,
+        origHeight: 0,
+
         bgImg: null,
         bgSrc: '',
         bgLoaded: false,
@@ -301,6 +324,20 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     }
 
     const cache = assetMediaCacheRef.current[assetId];
+
+    if (cache.origSrc !== origSrc && origSrc) {
+      cache.origSrc = origSrc;
+      cache.origLoaded = false;
+      const img = new Image();
+      img.onload = () => {
+        cache.origLoaded = true;
+        cache.origWidth = img.naturalWidth || img.width;
+        cache.origHeight = img.naturalHeight || img.height;
+        origDimensionsRef.current[assetId] = { width: cache.origWidth, height: cache.origHeight };
+      };
+      img.src = origSrc;
+      cache.origImg = img;
+    }
 
     if (cache.bgSrc !== bgSrc && bgSrc) {
       cache.bgSrc = bgSrc;
@@ -360,12 +397,26 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     ctx.save();
-    // 1. Draw base/background image (e.g., the rectangle)
-    const baseScale = Math.min(origWidth / newImg.width, origHeight / newImg.height);
+    // 1. Draw base/background image matching previous image size and position
+    const fitMode = editSet?.fitMode || 'cover';
     const userScale = (editSet?.scale ?? 100) / 100;
-    
-    const drawW = newImg.width * baseScale * userScale;
-    const drawH = newImg.height * baseScale * userScale;
+    let baseScale = 1;
+    let drawW = origWidth;
+    let drawH = origHeight;
+
+    if (fitMode === 'stretch') {
+      drawW = origWidth * userScale;
+      drawH = origHeight * userScale;
+    } else if (fitMode === 'contain') {
+      baseScale = Math.min(origWidth / newImg.width, origHeight / newImg.height);
+      drawW = newImg.width * baseScale * userScale;
+      drawH = newImg.height * baseScale * userScale;
+    } else {
+      // Default: 'cover' (fills the exact frame like the previous image without letterboxing!)
+      baseScale = Math.max(origWidth / newImg.width, origHeight / newImg.height);
+      drawW = newImg.width * baseScale * userScale;
+      drawH = newImg.height * baseScale * userScale;
+    }
     
     const drawX = (canvas.width - drawW) / 2 + (editSet?.offsetX ?? 0);
     const drawY = (canvas.height - drawH) / 2 - (editSet?.offsetY ?? 0);
@@ -398,28 +449,41 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     let opacity1 = 0;
     let opacity2 = 0;
 
-    // Overlay 1 (Word 1): active range 0% to 50%
-    if (progressPercent >= 0 && progressPercent <= 50) {
-      if (progressPercent < 15) {
-        // Fade in from 0% to 15%
-        opacity1 = progressPercent / 15;
-      } else if (progressPercent > 35) {
-        // Fade out from 35% to 50%
-        opacity1 = (50 - progressPercent) / 15;
-      } else {
+    const hasBothOverlays = !!over1Img && !!over2Img;
+
+    if (hasBothOverlays) {
+      // إذا تم وضع القطعتين معاً: تطبيق تأثير الظهور والاختفاء المتزامن مع وقت المشهد
+      // Overlay 1: active range 0% to 50% مع Fade In و Fade Out
+      if (progressPercent >= 0 && progressPercent <= 50) {
+        if (progressPercent < 15) {
+          // ظهور تدريجي من 0% إلى 15%
+          opacity1 = progressPercent / 15;
+        } else if (progressPercent > 35) {
+          // اختفاء تدريجي من 35% إلى 50%
+          opacity1 = (50 - progressPercent) / 15;
+        } else {
+          opacity1 = 1;
+        }
+      }
+
+      // Overlay 2: active range 50% to 100% مع Fade In و Fade Out
+      if (progressPercent >= 50 && progressPercent <= 100) {
+        if (progressPercent < 65) {
+          // ظهور تدريجي من 50% إلى 65%
+          opacity2 = (progressPercent - 50) / 15;
+        } else if (progressPercent > 85) {
+          // اختفاء تدريجي من 85% إلى 100%
+          opacity2 = (100 - progressPercent) / 15;
+        } else {
+          opacity2 = 1;
+        }
+      }
+    } else {
+      // إذا تم وضع قطعة واحدة فقط: تظهر بشكل ثابت ودائم طوال المشهد بالكامل (0% إلى 100%) دون اختفاء
+      if (over1Img) {
         opacity1 = 1;
       }
-    }
-
-    // Overlay 2 (Word 2): active range 50% to 100%
-    if (progressPercent >= 50 && progressPercent <= 100) {
-      if (progressPercent < 65) {
-        // Fade in from 50% to 65%
-        opacity2 = (progressPercent - 50) / 15;
-      } else if (progressPercent > 85) {
-        // Fade out from 85% to 100%
-        opacity2 = (100 - progressPercent) / 15;
-      } else {
+      if (over2Img) {
         opacity2 = 1;
       }
     }
@@ -858,26 +922,36 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
               activeAssets.forEach((asset: any) => {
                 const assetId = asset.id;
                 
+                // If asset is hidden/deleted from frame, ensure it stays hidden
+                if (hiddenAssetsRef.current.has(assetId)) {
+                  player.setImage(TRANSPARENT_1PX, assetId);
+                  return;
+                }
+
                 const hasOverlay1 = !!addedAssets1Ref.current[assetId];
                 const hasOverlay2 = !!addedAssets2Ref.current[assetId];
                 const hasReplacement = !!uploadedAssetsRef.current[assetId];
                 const hasSettings = !!savedEditSettingsRef.current[assetId];
 
                 if (hasOverlay1 || hasOverlay2 || hasReplacement || hasSettings) {
+                  const origSrc = asset.data;
                   const bgSrc = uploadedAssetsRef.current[assetId] || asset.data;
                   const over1Src = addedAssets1Ref.current[assetId] || '';
                   const over2Src = addedAssets2Ref.current[assetId] || '';
 
-                  const cache = getMediaCache(assetId, bgSrc, over1Src, over2Src);
+                  const cache = getMediaCache(assetId, origSrc, bgSrc, over1Src, over2Src);
 
                   if (cache.bgImg && cache.bgLoaded) {
                     const editSet = savedEditSettingsRef.current[assetId];
                     const over1Set = savedAddedSettings1Ref.current[assetId];
                     const over2Set = savedAddedSettings2Ref.current[assetId];
 
+                    const origW = cache.origWidth || origDimensionsRef.current[assetId]?.width || cache.origImg?.naturalWidth || 500;
+                    const origH = cache.origHeight || origDimensionsRef.current[assetId]?.height || cache.origImg?.naturalHeight || 500;
+
                     const dynamicFrameCanvas = generateProgressFrame(
-                      cache.bgImg.width || 500,
-                      cache.bgImg.height || 500,
+                      origW,
+                      origH,
                       cache.bgImg,
                       cache.over1Loaded ? cache.over1Img : null,
                       cache.over2Loaded ? cache.over2Img : null,
@@ -1016,6 +1090,18 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                 : videoItem.images[key].src
             }));
             setAssets(extracted);
+
+            // Pre-measure original asset dimensions for precise layer placement and scale
+            extracted.forEach(asset => {
+              const img = new Image();
+              img.onload = () => {
+                origDimensionsRef.current[asset.id] = {
+                  width: img.naturalWidth || img.width || 100,
+                  height: img.naturalHeight || img.height || 100
+                };
+              };
+              img.src = asset.data;
+            });
           }
           videoItemRef.current = videoItem;
           setHasAudio(!!(videoItem.audios && videoItem.audios.length > 0));
@@ -1247,7 +1333,8 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
         glowIntensity: 0,
         solidFill: 0,
         glowColor: '#ffffff',
-        smartMatch: true
+        smartMatch: true,
+        fitMode: 'cover'
       });
 
       const existingAddedData1 = addedAssets1[assetId];
@@ -1303,7 +1390,8 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
             glowIntensity: 0,
             solidFill: 0,
             glowColor: '#ffffff',
-            smartMatch: true
+            smartMatch: true,
+            fitMode: 'cover'
           });
         };
         reader.readAsDataURL(file);
@@ -1330,12 +1418,26 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
       const newImg = new Image();
       newImg.onload = () => {
         ctx.save();
-        // Base scale to match original image size relative to the canvas
-        const baseScale = Math.min(origImg.width / newImg.width, origImg.height / newImg.height);
+        // Scale and position to match original image size relative to the canvas
+        const fitMode = editSettings.fitMode || 'cover';
         const userScale = editSettings.scale / 100;
-        
-        const drawW = newImg.width * baseScale * userScale;
-        const drawH = newImg.height * baseScale * userScale;
+        let baseScale = 1;
+        let drawW = origImg.width;
+        let drawH = origImg.height;
+
+        if (fitMode === 'stretch') {
+          drawW = origImg.width * userScale;
+          drawH = origImg.height * userScale;
+        } else if (fitMode === 'contain') {
+          baseScale = Math.min(origImg.width / newImg.width, origImg.height / newImg.height);
+          drawW = newImg.width * baseScale * userScale;
+          drawH = newImg.height * baseScale * userScale;
+        } else {
+          // Default: 'cover' (fills the exact frame like the previous image without letterboxing!)
+          baseScale = Math.max(origImg.width / newImg.width, origImg.height / newImg.height);
+          drawW = newImg.width * baseScale * userScale;
+          drawH = newImg.height * baseScale * userScale;
+        }
         
         // Center in the canvas and apply user offsets
         const drawX = (canvas.width - drawW) / 2 + editSettings.offsetX;
@@ -1425,11 +1527,25 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     if (!ctx) return '';
 
     ctx.save();
-    const baseScale = Math.min(origImg.width / newImg.width, origImg.height / newImg.height);
+    const fitMode = editSettings.fitMode || 'cover';
     const userScale = editSettings.scale / 100;
-    
-    const drawW = newImg.width * baseScale * userScale;
-    const drawH = newImg.height * baseScale * userScale;
+    let baseScale = 1;
+    let drawW = origImg.width;
+    let drawH = origImg.height;
+
+    if (fitMode === 'stretch') {
+      drawW = origImg.width * userScale;
+      drawH = origImg.height * userScale;
+    } else if (fitMode === 'contain') {
+      baseScale = Math.min(origImg.width / newImg.width, origImg.height / newImg.height);
+      drawW = newImg.width * baseScale * userScale;
+      drawH = newImg.height * baseScale * userScale;
+    } else {
+      // Default: 'cover' (fills the exact frame like the previous image without letterboxing!)
+      baseScale = Math.max(origImg.width / newImg.width, origImg.height / newImg.height);
+      drawW = newImg.width * baseScale * userScale;
+      drawH = newImg.height * baseScale * userScale;
+    }
     
     const drawX = (canvas.width - drawW) / 2 + editSettings.offsetX;
     const drawY = (canvas.height - drawH) / 2 - editSettings.offsetY;
@@ -1509,8 +1625,17 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
           };
 
           Promise.all([loadOverlay1(), loadOverlay2()]).then(([over1, over2]) => {
-            const part1 = generatePreviewDataUrl(origImg, newImg, over1, addedFileSettings1);
-            const part2 = generatePreviewDataUrl(origImg, newImg, over2, addedFileSettings2);
+            const hasBoth = !!over1 && !!over2;
+            const singleOverlay = (!hasBoth && over1) ? over1 : (!hasBoth && over2) ? over2 : null;
+            const singleSettings = (!hasBoth && over1) ? addedFileSettings1 : (!hasBoth && over2) ? addedFileSettings2 : null;
+
+            const part1 = singleOverlay
+              ? generatePreviewDataUrl(origImg, newImg, singleOverlay, singleSettings)
+              : generatePreviewDataUrl(origImg, newImg, over1, addedFileSettings1);
+
+            const part2 = singleOverlay
+              ? generatePreviewDataUrl(origImg, newImg, singleOverlay, singleSettings)
+              : generatePreviewDataUrl(origImg, newImg, over2, addedFileSettings2);
 
             setReplacedAssetsPart1(prev => ({ ...prev, [editingAsset.id]: part1 }));
             setReplacedAssetsPart2(prev => ({ ...prev, [editingAsset.id]: part2 }));
@@ -1791,42 +1916,108 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
   };
 
   const toggleAssetVisibility = (assetId: string) => {
-    if (!playerRef.current || !videoItemRef.current) return;
+    if (!playerRef.current) return;
     
     setHiddenAssets(prev => {
       const newHidden = new Set(prev);
-      if (newHidden.has(assetId)) {
-        newHidden.delete(assetId);
-      } else {
+      const isNowHidden = !newHidden.has(assetId);
+      if (isNowHidden) {
         newHidden.add(assetId);
+      } else {
+        newHidden.delete(assetId);
+      }
+      hiddenAssetsRef.current = newHidden;
+      
+      const videoItem = videoItemRef.current;
+      if (videoItem) {
+        if (videoItem.sprites) {
+          videoItem.sprites.forEach((sprite: any) => {
+            if (sprite.imageKey === assetId && sprite.frames) {
+              sprite.frames.forEach((frame: any) => {
+                if (isNowHidden) {
+                  if (frame._origAlpha === undefined) frame._origAlpha = frame.alpha ?? 1;
+                  frame.alpha = 0;
+                } else {
+                  frame.alpha = frame._origAlpha !== undefined ? frame._origAlpha : 1;
+                }
+              });
+            }
+          });
+        }
+
+        if (videoItem.images) {
+          if (isNowHidden) {
+            videoItem.images[assetId] = TRANSPARENT_1PX;
+          } else {
+            const restoredData = replacedAssetsPart1[assetId] || uploadedAssets[assetId] || assets.find(a => a.id === assetId)?.data;
+            if (restoredData) {
+              videoItem.images[assetId] = restoredData;
+            }
+          }
+        }
       }
       
-      // Update SVGA player dynamically
-      const videoItem = videoItemRef.current;
-      if (videoItem && videoItem.sprites) {
-        // We need to modify the sprites array to hide/show the specific imageKey
-        videoItem.sprites.forEach((sprite: any) => {
-          if (sprite.imageKey === assetId) {
-            // If hiding, we set alpha to 0 for all frames. If showing, we restore original alpha.
-            // SVGA Player doesn't have a direct "hide layer" API, so we manipulate the dynamic text/image feature
-            // or we can use setImage to replace it with an empty transparent image
-          }
-        });
-        
-        if (newHidden.has(assetId)) {
-          // Hide by setting an empty transparent 1x1 image
-          playerRef.current.setImage('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', assetId);
+      if (playerRef.current) {
+        if (isNowHidden) {
+          playerRef.current.setImage(TRANSPARENT_1PX, assetId);
         } else {
-          // Restore original image
-          const originalAsset = assets.find(a => a.id === assetId);
-          if (originalAsset) {
-            playerRef.current.setImage(originalAsset.data, assetId);
+          const restoredData = replacedAssetsPart1[assetId] || uploadedAssets[assetId] || assets.find(a => a.id === assetId)?.data;
+          if (restoredData) {
+            playerRef.current.setImage(restoredData, assetId);
           }
         }
       }
       
       return newHidden;
     });
+  };
+
+  const restoreOriginalAsset = (assetId: string) => {
+    const original = assets.find(a => a.id === assetId);
+    if (!original) return;
+
+    setReplacedAssetsPart1(prev => {
+      const copy = { ...prev };
+      delete copy[assetId];
+      return copy;
+    });
+    setReplacedAssetsPart2(prev => {
+      const copy = { ...prev };
+      delete copy[assetId];
+      return copy;
+    });
+    setUploadedAssets(prev => {
+      const copy = { ...prev };
+      delete copy[assetId];
+      return copy;
+    });
+    setAddedAssets1(prev => {
+      const copy = { ...prev };
+      delete copy[assetId];
+      return copy;
+    });
+    setAddedAssets2(prev => {
+      const copy = { ...prev };
+      delete copy[assetId];
+      return copy;
+    });
+    setSavedEditSettings(prev => {
+      const copy = { ...prev };
+      delete copy[assetId];
+      return copy;
+    });
+
+    if (assetMediaCacheRef.current[assetId]) {
+      delete assetMediaCacheRef.current[assetId];
+    }
+
+    if (videoItemRef.current && videoItemRef.current.images) {
+      videoItemRef.current.images[assetId] = original.data;
+    }
+
+    if (playerRef.current) {
+      playerRef.current.setImage(original.data, assetId);
+    }
   };
 
   const exportAsZip = async () => {
@@ -1837,7 +2028,8 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     try {
       setExporting(true);
       setExportProgress(0);
-      setExportStatus('جاري تهيئة محرك الاستخراج...');
+      setExportTitle('تصدير إطارات PNG');
+      setExportStatus('جاري تهيئة محرك الاستخراج السريع...');
       
       playerRef.current.pauseAnimation();
       setStatus(PlayerStatus.PAUSED);
@@ -1877,15 +2069,23 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
       exportPlayer.setContentMode('Fill'); 
       exportPlayer.setVideoItem(videoItemRef.current);
 
-      // Apply hidden assets to export player
+      // Apply hidden assets to export player immediately
       hiddenAssets.forEach(assetId => {
-         exportPlayer.setImage('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', assetId);
+         exportPlayer.setImage(TRANSPARENT_1PX, assetId);
       });
 
-      await new Promise(r => setTimeout(r, 800));
+      // Quick wait for player canvas to initialize
+      let attempts = 0;
+      while (!exportContainer.querySelector('canvas') && attempts < 25) {
+        await new Promise(r => setTimeout(r, 20));
+        attempts++;
+      }
+      if (!exportContainer.querySelector('canvas')) {
+        await new Promise(r => setTimeout(r, 100));
+      }
 
-      setExportStatus('جاري تحميل وتجهيز صور الملحقات...');
-      // Pre-load all edited asset caches before running the synchronous loop
+      setExportStatus('جاري تجهيز وسائط الإطارات...');
+      // Pre-load all edited asset caches before running the loop
       const loadPromises: Promise<void>[] = [];
       const activeAssetsBefore = assetsRef.current || [];
       activeAssetsBefore.forEach((asset: any) => {
@@ -1896,11 +2096,12 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
         const hasSettings = !!savedEditSettingsRef.current[assetId];
 
         if (hasOverlay1 || hasOverlay2 || hasReplacement || hasSettings) {
+          const origSrc = asset.data;
           const bgSrc = uploadedAssetsRef.current[assetId] || asset.data;
           const over1Src = addedAssets1Ref.current[assetId] || '';
           const over2Src = addedAssets2Ref.current[assetId] || '';
 
-          const cache = getMediaCache(assetId, bgSrc, over1Src, over2Src);
+          const cache = getMediaCache(assetId, origSrc, bgSrc, over1Src, over2Src);
           
           const waitForCache = () => {
             return new Promise<void>((resolve) => {
@@ -1911,7 +2112,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                 if (bgOk && over1Ok && over2Ok) {
                   resolve();
                 } else {
-                  setTimeout(check, 30);
+                  setTimeout(check, 20);
                 }
               };
               check();
@@ -1922,37 +2123,89 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
       });
 
       await Promise.all(loadPromises);
-      await new Promise(r => setTimeout(r, 200));
+
+      // Separate assets that have dual animated fades from static modified assets
+      const dynamicFadeAssets: any[] = [];
+      activeAssetsBefore.forEach((asset: any) => {
+        const assetId = asset.id;
+        if (hiddenAssets.has(assetId)) {
+          exportPlayer.setImage(TRANSPARENT_1PX, assetId);
+          return;
+        }
+
+        const hasOverlay1 = !!addedAssets1Ref.current[assetId];
+        const hasOverlay2 = !!addedAssets2Ref.current[assetId];
+        const hasReplacement = !!uploadedAssetsRef.current[assetId];
+        const hasSettings = !!savedEditSettingsRef.current[assetId];
+
+        if (hasOverlay1 && hasOverlay2) {
+          // Dynamic dual overlay fades require per-frame updates
+          dynamicFadeAssets.push(asset);
+        } else if (hasOverlay1 || hasOverlay2 || hasReplacement || hasSettings) {
+          // Static replacement or single overlay can be prepared once
+          const origSrc = asset.data;
+          const bgSrc = uploadedAssetsRef.current[assetId] || asset.data;
+          const over1Src = addedAssets1Ref.current[assetId] || '';
+          const over2Src = addedAssets2Ref.current[assetId] || '';
+          const cache = getMediaCache(assetId, origSrc, bgSrc, over1Src, over2Src);
+
+          if (cache.bgImg && cache.bgLoaded) {
+            const editSet = savedEditSettingsRef.current[assetId];
+            const over1Set = savedAddedSettings1Ref.current[assetId];
+            const over2Set = savedAddedSettings2Ref.current[assetId];
+            const origW = cache.origWidth || origDimensionsRef.current[assetId]?.width || cache.origImg?.naturalWidth || 500;
+            const origH = cache.origHeight || origDimensionsRef.current[assetId]?.height || cache.origImg?.naturalHeight || 500;
+
+            const staticFrame = generateProgressFrame(
+              origW,
+              origH,
+              cache.bgImg,
+              cache.over1Loaded ? cache.over1Img : null,
+              cache.over2Loaded ? cache.over2Img : null,
+              editSet,
+              over1Set,
+              over2Set,
+              0
+            );
+
+            if (staticFrame) {
+              exportPlayer.setImage(staticFrame, assetId);
+            }
+          }
+        }
+      });
+
+      // Prepare reusable canvas and 2d context for blazing-fast frame extraction
+      const outCanvas = document.createElement('canvas');
+      outCanvas.width = exportWidth;
+      outCanvas.height = exportHeight;
+      const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
+      if (!outCtx) throw new Error('فشل تهيئة Canvas التصدير');
 
       for (let i = 0; i < totalFrames; i++) {
         setExportStatus(`جاري التقاط الإطار ${i + 1} من ${totalFrames}...`);
         
-        // Render dynamic overlay fades and alignments on each frame before capturing
-        const currentProgress = (i / totalFrames) * 100;
-        const activeAssets = assetsRef.current || [];
-        activeAssets.forEach((asset: any) => {
-          const assetId = asset.id;
-          
-          const hasOverlay1 = !!addedAssets1Ref.current[assetId];
-          const hasOverlay2 = !!addedAssets2Ref.current[assetId];
-          const hasReplacement = !!uploadedAssetsRef.current[assetId];
-          const hasSettings = !!savedEditSettingsRef.current[assetId];
-
-          if (hasOverlay1 || hasOverlay2 || hasReplacement || hasSettings) {
+        // Update dynamic overlays ONLY if there are assets with dual fade animations
+        if (dynamicFadeAssets.length > 0) {
+          const currentProgress = (i / totalFrames) * 100;
+          dynamicFadeAssets.forEach((asset: any) => {
+            const assetId = asset.id;
+            const origSrc = asset.data;
             const bgSrc = uploadedAssetsRef.current[assetId] || asset.data;
             const over1Src = addedAssets1Ref.current[assetId] || '';
             const over2Src = addedAssets2Ref.current[assetId] || '';
-
-            const cache = getMediaCache(assetId, bgSrc, over1Src, over2Src);
+            const cache = getMediaCache(assetId, origSrc, bgSrc, over1Src, over2Src);
 
             if (cache.bgImg && cache.bgLoaded) {
               const editSet = savedEditSettingsRef.current[assetId];
               const over1Set = savedAddedSettings1Ref.current[assetId];
               const over2Set = savedAddedSettings2Ref.current[assetId];
+              const origW = cache.origWidth || origDimensionsRef.current[assetId]?.width || cache.origImg?.naturalWidth || 500;
+              const origH = cache.origHeight || origDimensionsRef.current[assetId]?.height || cache.origImg?.naturalHeight || 500;
 
               const dynamicFrameCanvas = generateProgressFrame(
-                cache.bgImg.width || 500,
-                cache.bgImg.height || 500,
+                origW,
+                origH,
                 cache.bgImg,
                 cache.over1Loaded ? cache.over1Img : null,
                 cache.over2Loaded ? cache.over2Img : null,
@@ -1966,42 +2219,48 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                 exportPlayer.setImage(dynamicFrameCanvas, assetId);
               }
             }
-          }
-        });
+          });
+        }
 
         exportPlayer.stepToFrame(i, false);
-        await new Promise(r => setTimeout(r, 100));
+        // Micro-delay to allow canvas frame rendering flush
+        await new Promise(r => setTimeout(r, 12));
         
         const canvas = exportContainer.querySelector('canvas');
         if (canvas) {
-          const outCanvas = document.createElement('canvas');
-          outCanvas.width = exportWidth;
-          outCanvas.height = exportHeight;
-          const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
-          if (outCtx) {
-            outCtx.clearRect(0, 0, exportWidth, exportHeight);
-            outCtx.drawImage(canvas, 0, 0, exportWidth, exportHeight);
-            
-            // Generate optimized lossless PNG using UPNG (drastically smaller file size with 100% original quality and alpha)
-            try {
-              const imgData = outCtx.getImageData(0, 0, exportWidth, exportHeight);
-              const pngBuffer = UPNG.encode([imgData.data.buffer], exportWidth, exportHeight, 0);
-              const frameFileName = `${i.toString().padStart(3, '0')}.png`;
-              zip.file(frameFileName, pngBuffer);
-            } catch (err) {
-              // Fallback to canvas.toDataURL if UPNG encoding fails
-              const dataUrl = outCanvas.toDataURL('image/png');
-              const base64Data = dataUrl.replace(/^data:image\/(png|jpg);base64,/, "");
-              const frameFileName = `${i.toString().padStart(3, '0')}.png`;
-              zip.file(frameFileName, base64Data, {base64: true});
-            }
+          outCtx.clearRect(0, 0, exportWidth, exportHeight);
+          outCtx.drawImage(canvas, 0, 0, exportWidth, exportHeight);
+          
+          const frameFileName = `${i.toString().padStart(3, '0')}.png`;
+
+          // Ultra-fast native asynchronous PNG encoding using browser's hardware-accelerated toBlob
+          const blob = await new Promise<Blob | null>((resolve) => {
+            outCanvas.toBlob((b) => resolve(b), 'image/png');
+          });
+
+          if (blob) {
+            zip.file(frameFileName, blob);
+          } else {
+            // High-reliability fallback
+            const dataUrl = outCanvas.toDataURL('image/png');
+            const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
+            zip.file(frameFileName, base64Data, { base64: true });
           }
         }
-        setExportProgress(Math.round(((i + 1) / totalFrames) * 100));
+        setExportProgress(Math.round(((i + 1) / totalFrames) * 90));
       }
 
-      setExportStatus('جاري ضغط الملف وتحضير التحميل...');
-      const content = await zip.generateAsync({type: "blob"});
+      setExportStatus('جاري تجميع حزمة التحميل...');
+      // PNG files are already lossless compressed with DEFLATE; STORE compression avoids re-compressing and takes <0.3s
+      const content = await zip.generateAsync(
+        { type: "blob", compression: "STORE" },
+        (meta: any) => {
+          if (meta.percent) {
+            setExportProgress(90 + Math.round(meta.percent * 0.1));
+          }
+        }
+      );
+      
       const link = document.createElement('a');
       link.href = URL.createObjectURL(content);
       link.download = `${file.name.replace('.svga', '')}_Sequence.zip`;
@@ -2040,6 +2299,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     try {
       setExporting(true);
       setExportProgress(0);
+      setExportTitle('تصدير مشروع After Effects');
       setExportStatus('جاري تحضير ملفات After Effects...');
       
       const zip = new JSZip();
@@ -2223,6 +2483,147 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
     }
   };
 
+  // Export all pieces / contents of the SVGA file (border pieces, entrance pieces, images, sound) as a ZIP folder
+  const exportFileContents = async () => {
+    if (!videoItemRef.current || exporting || assets.length === 0) return;
+    const JSZipModule = (window as any).JSZip || JSZip;
+    if (!JSZipModule) return alert("يرجى الانتظار لتحميل المكتبات اللازمة.");
+
+    try {
+      setExporting(true);
+      setExportProgress(5);
+      setExportTitle('تصدير المحتويات');
+      setExportStatus('جاري استخراج قطع الإطار والعناصر الأصلية...');
+
+      const zip = new JSZipModule();
+      const videoItem = videoItemRef.current;
+      const cleanFileName = (file.name || 'svga_project').replace(/\.svga$/i, '');
+
+      // 1. Process and add all image assets
+      for (let i = 0; i < assets.length; i++) {
+        const asset = assets[i];
+        // Use replaced asset if available, else original data
+        const activeData = replacedAssetsPart1[asset.id] || replacedAssetsPart2[asset.id] || asset.data;
+        let base64Data = '';
+        let ext = 'png';
+
+        if (typeof activeData === 'string') {
+          if (activeData.startsWith('data:image/')) {
+            const match = activeData.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
+            if (match) {
+              ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+              base64Data = match[2];
+            } else {
+              base64Data = activeData.replace(/^data:image\/[a-zA-Z0-9]+;base64,/, '');
+            }
+          } else if (activeData.startsWith('data:audio/')) {
+            ext = 'mp3';
+            base64Data = activeData.replace(/^data:audio\/[a-zA-Z0-9\-_]+;base64,/, '');
+          } else {
+            base64Data = activeData;
+          }
+        } else if ((activeData as any)?.src) {
+          const src = (activeData as any).src;
+          base64Data = src.replace(/^data:[^;]+;base64,/, '');
+        }
+
+        if (base64Data) {
+          const safeId = asset.id.replace(/[\\/:*?"<>|]/g, '_');
+          const fileName = safeId.toLowerCase().endsWith(`.${ext}`) ? safeId : `${safeId}.${ext}`;
+          zip.file(fileName, base64Data, { base64: true });
+        }
+
+        const pct = 5 + Math.round(((i + 1) / assets.length) * 65);
+        setExportProgress(pct);
+        setExportStatus(`جاري استخراج القطع (${i + 1} من ${assets.length})...`);
+      }
+
+      // 2. Extract any embedded audio files
+      if (videoItem.audios && Array.isArray(videoItem.audios) && videoItem.audios.length > 0) {
+        setExportStatus('جاري استخراج المؤثرات الصوتية...');
+        videoItem.audios.forEach((audioItem: any, idx: number) => {
+          const aKey = audioItem.audioKey;
+          const rawAudio = videoItem.images ? videoItem.images[aKey] : null;
+          if (rawAudio) {
+            let audioBase64 = '';
+            if (typeof rawAudio === 'string') {
+              audioBase64 = rawAudio.replace(/^data:[^;]+;base64,/, '');
+            } else if (rawAudio.src) {
+              audioBase64 = rawAudio.src.replace(/^data:[^;]+;base64,/, '');
+            }
+            if (audioBase64) {
+              const safeKey = (aKey || `audio_${idx + 1}`).replace(/[\\/:*?"<>|]/g, '_');
+              const audioName = safeKey.toLowerCase().endsWith('.mp3') ? safeKey : `${safeKey}.mp3`;
+              zip.file(audioName, audioBase64, { base64: true });
+            }
+          }
+        });
+      }
+
+      // 3. Add details info JSON & text description
+      const width = videoItem.videoSize?.width || 500;
+      const height = videoItem.videoSize?.height || 500;
+      const fps = videoItem.FPS || 30;
+      const totalFramesCount = videoItem.frames || 1;
+      const durationSec = Number((totalFramesCount / fps).toFixed(2));
+
+      const infoObject = {
+        name: file.name,
+        width,
+        height,
+        fps,
+        totalFrames: totalFramesCount,
+        durationSeconds: durationSec,
+        piecesCount: assets.length,
+        pieces: assets.map(a => a.id),
+        hasAudio: !!(videoItem.audios && videoItem.audios.length > 0)
+      };
+      zip.file('info.json', JSON.stringify(infoObject, null, 2));
+
+      const readmeText = `تفاصيل محتويات ملف SVGA:
+-----------------------------
+اسم الملف: ${file.name}
+أبعاد العرض: ${width} × ${height} بكسل
+معدل الفريمات: ${fps} FPS
+عدد الفريمات الكامل: ${totalFramesCount} فريم
+المدة الزمنية: ${durationSec} ثانية
+عدد القطع المستخرجة: ${assets.length} قطعة
+تاريخ الاستخراج: ${new Date().toLocaleString('ar-EG')}
+-----------------------------
+تم استخراج جميع قطع ومحتويات الملف بنجاح بواسطة استوديو SVGA Pro.`;
+
+      zip.file('معلومات_الملف.txt', readmeText);
+
+      // 4. Generate the ZIP file
+      setExportProgress(80);
+      setExportStatus('جاري ضغط مجلد محتويات الملف...');
+
+      const content = await zip.generateAsync({ type: 'blob' }, (metadata: any) => {
+        setExportProgress(80 + Math.round(metadata.percent * 0.18));
+      });
+
+      setExportProgress(100);
+      setExportStatus('تم تجهيز محتويات الملف بنجاح!');
+
+      const url = URL.createObjectURL(content);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${cleanFileName}_محتويات_الملف.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+      setTimeout(() => {
+        setExporting(false);
+      }, 500);
+    } catch (err) {
+      console.error("Export contents error:", err);
+      setExporting(false);
+      alert("حدث خطأ أثناء تصدير محتويات الملف.");
+    }
+  };
+
   const downloadModifiedSVGA = async () => {
     const isResized = videoItemRef.current?.videoSize && (
       (typeof customWidth === 'number' && customWidth > 0 && customWidth !== videoItemRef.current.videoSize.width) ||
@@ -2312,6 +2713,16 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                           frame.transform.tx = (frame.transform.tx || 0) * scaleX;
                           frame.transform.ty = (frame.transform.ty || 0) * scaleY;
                         }
+                      });
+                    }
+                  });
+                }
+
+                if (specObj.sprites) {
+                  specObj.sprites.forEach((sprite: any) => {
+                    if (hiddenAssets.has(sprite.imageKey) && sprite.frames) {
+                      sprite.frames.forEach((frame: any) => {
+                        frame.alpha = 0;
                       });
                     }
                   });
@@ -2445,9 +2856,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
 
         if (message.images) {
           hiddenAssets.forEach(assetId => {
-            if (message.images[assetId]) {
-              message.images[assetId] = transparentPngBytes;
-            }
+            message.images[assetId] = transparentPngBytes;
           });
           
           Object.entries(replacedAssetsPart1).forEach(([assetId, dataUrl]) => {
@@ -2460,6 +2869,16 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
             if (replacedAssetsPart1[assetId]) return;
             if (message.images[assetId]) {
               message.images[assetId] = base64ToUint8Array(dataUrl as string);
+            }
+          });
+        }
+
+        if (message.sprites) {
+          message.sprites.forEach((sprite: any) => {
+            if (hiddenAssets.has(sprite.imageKey) && sprite.frames) {
+              sprite.frames.forEach((frame: any) => {
+                frame.alpha = 0;
+              });
             }
           });
         }
@@ -2564,7 +2983,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                     <FileArchive size={20} className="text-blue-500" />
                 </div>
                 <div className="text-right">
-                    <h3 className="text-2xl font-black text-white">تصدير PNG</h3>
+                    <h3 className="text-2xl font-black text-white">{exportTitle}</h3>
                     <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mt-1">
                         {exportStatus}
                     </p>
@@ -2593,10 +3012,19 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
       <div className="flex flex-col h-[750px] bg-slate-900/50 overflow-hidden shadow-2xl relative border border-slate-800/50 rounded-[2.5rem]">
         <div className="px-8 py-6 border-b border-slate-800 flex items-center justify-between bg-slate-900/50 z-30">
           <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+            <div className="w-2 h-2 rounded-full bg-blue-500"></div>
             <h4 className="text-sm font-bold text-white truncate max-w-[250px]">{file.name}</h4>
           </div>
           <div className="flex items-center gap-2 flex-wrap justify-end">
+             <button 
+                onClick={exportFileContents}
+                disabled={(status !== PlayerStatus.PLAYING && status !== PlayerStatus.PAUSED) || exporting || assets.length === 0}
+                className="group flex items-center gap-2 px-4 py-2 bg-emerald-600/15 border border-emerald-500/50 text-emerald-300 rounded-xl text-xs font-bold hover:bg-emerald-600/25 transition-all disabled:opacity-30 active:scale-95 shadow-[0_0_15px_rgba(16,185,129,0.1)]"
+                title="تصدير جميع قطع الإطار / الدخولية وحفظها في مجلد ZIP"
+             >
+                <FolderArchive size={16} className="text-emerald-400 group-hover:scale-110 transition-transform" />
+                <span>تصدير المحتويات</span>
+             </button>
              <button 
                 onClick={exportAsAEProject}
                 disabled={status !== PlayerStatus.PLAYING && status !== PlayerStatus.PAUSED || exporting}
@@ -2828,14 +3256,28 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
 
       <div className="flex-1 p-8 bg-slate-900/50 border border-slate-800 rounded-[2.5rem] mt-8">
         <div className="max-w-6xl mx-auto">
-          <div className="flex items-center gap-3 mb-10 border-b border-slate-800 pb-5">
-            <div className="p-2 bg-indigo-500/10 rounded-xl">
-              <Layers className="text-indigo-400" size={20} />
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-10 border-b border-slate-800 pb-5">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-indigo-500/10 rounded-xl">
+                <Layers className="text-indigo-400" size={20} />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-white text-right">مكتبة العناصر</h3>
+                <p className="text-xs text-slate-500 text-right">العناصر الصورية المكتشفة داخل ملف الـ SVGA ({assets.length} قطعة)</p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-lg font-bold text-white text-right">مكتبة العناصر</h3>
-              <p className="text-xs text-slate-500 text-right">العناصر الصورية المكتشفة داخل ملف الـ SVGA</p>
-            </div>
+
+            {assets.length > 0 && (
+              <button
+                onClick={exportFileContents}
+                disabled={exporting}
+                className="flex items-center gap-2 px-4 py-2.5 bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/50 text-emerald-300 rounded-xl text-xs font-bold transition-all active:scale-95 shadow-sm"
+                title="تصدير وتحميل جميع قطع الإطار / الدخولية في مجلد مضغوط ZIP"
+              >
+                <FolderArchive size={16} className="text-emerald-400" />
+                <span>تصدير المحتويات</span>
+              </button>
+            )}
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-5">
@@ -2869,18 +3311,27 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                   <div className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2" onClick={(e) => e.stopPropagation()}>
                      <button 
                        onClick={() => toggleAssetVisibility(asset.id)} 
-                       className={`p-2.5 rounded-full text-white transition-all active:scale-90 ${isHidden ? 'bg-green-500/20 hover:bg-green-500/40' : 'bg-red-500/20 hover:bg-red-500/40'}`}
-                       title={isHidden ? "استرجاع القطعة" : "إخفاء القطعة"}
+                       className={`p-2.5 rounded-full text-white transition-all active:scale-90 ${isHidden ? 'bg-green-500/30 hover:bg-green-500/50 text-green-300' : 'bg-red-500/30 hover:bg-red-500/50 text-red-300'}`}
+                       title={isHidden ? "إعادة إظهار الصورة في الإطار" : "حذف / إخفاء الصورة من الإطار"}
                      >
                       {isHidden ? <Eye size={16} /> : <EyeOff size={16} />}
                      </button>
+                     {isReplaced && (
+                       <button 
+                         onClick={() => restoreOriginalAsset(asset.id)} 
+                         className="p-2.5 bg-amber-500/30 hover:bg-amber-500/50 rounded-full text-amber-300 transition-all active:scale-90"
+                         title="استعادة الصورة الأصلية وحذف الاستبدال"
+                       >
+                        <RotateCcw size={16} />
+                       </button>
+                     )}
                      <button 
                        onClick={() => {
                          setActiveReplaceId(asset.id);
                          fileInputRef.current?.click();
                        }} 
                        className="p-2.5 bg-blue-500/20 hover:bg-blue-500/40 rounded-full text-white transition-all active:scale-90"
-                       title="استبدال القطعة (بالمقاس الذكي)"
+                       title="استبدال الصورة (يأخذ نفس حجم ومكان الصورة السابقة)"
                      >
                       <RefreshCw size={16} />
                      </button>
@@ -2916,20 +3367,49 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
             <div 
               onMouseDown={handleDragStart}
               onTouchStart={handleTouchStart}
-              className="flex items-center justify-between p-5 border-b border-slate-800 bg-slate-950/20 cursor-grab active:cursor-grabbing select-none"
+              className="flex items-center justify-between p-4 sm:p-5 border-b border-slate-800 bg-slate-950/20 cursor-grab active:cursor-grabbing select-none"
             >
               <div className="flex items-center gap-2">
                 <Settings2 size={18} className="text-indigo-400" />
-                <h3 className="text-white text-sm font-bold truncate max-w-[220px]">تعديل: {editingAsset.id}</h3>
+                <h3 className="text-white text-sm font-bold truncate max-w-[140px] sm:max-w-[200px]">تعديل: {editingAsset.id}</h3>
               </div>
-              <button 
-                onClick={cancelEdit} 
-                onMouseDown={(e) => e.stopPropagation()} 
-                onTouchStart={(e) => e.stopPropagation()}
-                className="text-slate-400 hover:text-white p-1 rounded-full hover:bg-slate-800 transition-all"
-              >
-                <X size={18} />
-              </button>
+              <div className="flex items-center gap-2" onMouseDown={(e) => e.stopPropagation()} onTouchStart={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  onClick={() => toggleAssetVisibility(editingAsset.id)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                    hiddenAssets.has(editingAsset.id)
+                      ? 'bg-green-500/20 text-green-300 hover:bg-green-500/30 border border-green-500/30'
+                      : 'bg-red-500/20 text-red-300 hover:bg-red-500/30 border border-red-500/30'
+                  }`}
+                  title={hiddenAssets.has(editingAsset.id) ? "إعادة إظهار في الإطار" : "حذف/إخفاء الصورة من الإطار"}
+                >
+                  {hiddenAssets.has(editingAsset.id) ? <Eye size={13} /> : <EyeOff size={13} />}
+                  <span>{hiddenAssets.has(editingAsset.id) ? 'إظهار بالإطار' : 'إخفاء من الإطار'}</span>
+                </button>
+
+                {(uploadedAssets[editingAsset.id] || replacedAssetsPart1[editingAsset.id]) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      restoreOriginalAsset(editingAsset.id);
+                      cancelEdit();
+                    }}
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/30 transition-all"
+                    title="استعادة الصورة الأصلية للملف وحذف التعديل"
+                  >
+                    <RotateCcw size={13} />
+                    <span>استعادة الأصل</span>
+                  </button>
+                )}
+
+                <button 
+                  onClick={cancelEdit} 
+                  className="text-slate-400 hover:text-white p-1 rounded-full hover:bg-slate-800 transition-all"
+                >
+                  <X size={18} />
+                </button>
+              </div>
             </div>
 
             {/* Content Area */}
@@ -2980,25 +3460,23 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                 <div className="grid grid-cols-2 gap-2 bg-slate-900/60 p-1.5 rounded-xl border border-slate-800">
                   <button
                     onClick={() => setActiveOverlayTab('one')}
-                    className={`py-2 rounded-lg text-xs font-bold transition-all flex flex-col items-center gap-0.5 ${
+                    className={`py-2 rounded-lg text-xs font-bold transition-all ${
                       activeOverlayTab === 'one'
-                        ? 'bg-gradient-to-l from-green-500/20 to-emerald-500/10 text-green-400 border border-green-500/20 shadow-md'
+                        ? 'bg-gradient-to-l from-indigo-500/20 to-blue-500/10 text-indigo-400 border border-indigo-500/20 shadow-md'
                         : 'text-slate-400 hover:text-white border border-transparent'
                     }`}
                   >
-                    <span>القطعة الأولى</span>
-                    <span className="text-[9px] opacity-75 font-mono">(0% - 50%)</span>
+                    القطعة الأولى
                   </button>
                   <button
                     onClick={() => setActiveOverlayTab('two')}
-                    className={`py-2 rounded-lg text-xs font-bold transition-all flex flex-col items-center gap-0.5 ${
+                    className={`py-2 rounded-lg text-xs font-bold transition-all ${
                       activeOverlayTab === 'two'
-                        ? 'bg-gradient-to-l from-green-500/20 to-emerald-500/10 text-green-400 border border-green-500/20 shadow-md'
+                        ? 'bg-gradient-to-l from-indigo-500/20 to-blue-500/10 text-indigo-400 border border-indigo-500/20 shadow-md'
                         : 'text-slate-400 hover:text-white border border-transparent'
                     }`}
                   >
-                    <span>القطعة الثانية</span>
-                    <span className="text-[9px] opacity-75 font-mono">(50% - 100%)</span>
+                    القطعة الثانية
                   </button>
                 </div>
 
@@ -3020,7 +3498,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                       <div className="flex flex-col gap-1.5">
                         <div className="flex justify-between text-xs font-bold text-slate-300">
                           <span>حجم القطعة</span>
-                          <span className="text-green-400">{addedFileSettings1.scale}%</span>
+                          <span className="text-indigo-400">{addedFileSettings1.scale}%</span>
                         </div>
                         <input 
                           type="range" 
@@ -3028,7 +3506,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                           max="200" 
                           value={addedFileSettings1.scale} 
                           onChange={(e) => setAddedFileSettings1(s => ({...s, scale: Number(e.target.value)}))} 
-                          className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                          className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                         />
                       </div>
 
@@ -3037,7 +3515,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>إزاحة أفقية (X)</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings1.offsetX}px</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings1.offsetX}px</span>
                           </div>
                           <input 
                             type="range" 
@@ -3054,14 +3532,14 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                                 setAddedFileSettings1(s => ({ ...s, offsetX: Math.max(-400, s.offsetX - 1) }));
                               }
                             }}
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
 
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>إزاحة عمودية (Y)</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings1.offsetY}px</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings1.offsetY}px</span>
                           </div>
                           <input 
                             type="range" 
@@ -3078,7 +3556,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                                 setAddedFileSettings1(s => ({ ...s, offsetY: Math.max(-400, s.offsetY - 1) }));
                               }
                             }}
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
                       </div>
@@ -3088,7 +3566,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>زاوية الدوران</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings1.rotation}°</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings1.rotation}°</span>
                           </div>
                           <input 
                             type="range" 
@@ -3096,14 +3574,14 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                             max="180" 
                             value={addedFileSettings1.rotation} 
                             onChange={(e) => setAddedFileSettings1(s => ({...s, rotation: Number(e.target.value)}))} 
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
 
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>الشفافية</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings1.opacity}%</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings1.opacity}%</span>
                           </div>
                           <input 
                             type="range" 
@@ -3111,7 +3589,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                             max="100" 
                             value={addedFileSettings1.opacity} 
                             onChange={(e) => setAddedFileSettings1(s => ({...s, opacity: Number(e.target.value)}))} 
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
                       </div>
@@ -3119,9 +3597,9 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                   ) : (
                     <button
                       onClick={() => addedFileInputRef.current?.click()}
-                      className="border-2 border-dashed border-slate-800 hover:border-green-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 group transition-all bg-slate-900/20 active:scale-95"
+                      className="border-2 border-dashed border-slate-800 hover:border-indigo-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 group transition-all bg-slate-900/20 active:scale-95"
                     >
-                      <Plus className="text-slate-500 group-hover:text-green-400 transition-colors" size={24} />
+                      <Plus className="text-slate-500 group-hover:text-indigo-400 transition-colors" size={24} />
                       <span className="text-xs text-slate-400 group-hover:text-slate-300 font-bold">اضغط لإضافة صورة للقطعة الأولى</span>
                     </button>
                   )
@@ -3142,7 +3620,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                       <div className="flex flex-col gap-1.5">
                         <div className="flex justify-between text-xs font-bold text-slate-300">
                           <span>حجم القطعة</span>
-                          <span className="text-green-400">{addedFileSettings2.scale}%</span>
+                          <span className="text-indigo-400">{addedFileSettings2.scale}%</span>
                         </div>
                         <input 
                           type="range" 
@@ -3150,7 +3628,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                           max="200" 
                           value={addedFileSettings2.scale} 
                           onChange={(e) => setAddedFileSettings2(s => ({...s, scale: Number(e.target.value)}))} 
-                          className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                          className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                         />
                       </div>
 
@@ -3159,7 +3637,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>إزاحة أفقية (X)</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings2.offsetX}px</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings2.offsetX}px</span>
                           </div>
                           <input 
                             type="range" 
@@ -3176,14 +3654,14 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                                 setAddedFileSettings2(s => ({ ...s, offsetX: Math.max(-400, s.offsetX - 1) }));
                               }
                             }}
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
 
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>إزاحة عمودية (Y)</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings2.offsetY}px</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings2.offsetY}px</span>
                           </div>
                           <input 
                             type="range" 
@@ -3200,7 +3678,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                                 setAddedFileSettings2(s => ({ ...s, offsetY: Math.max(-400, s.offsetY - 1) }));
                               }
                             }}
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
                       </div>
@@ -3210,7 +3688,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>زاوية الدوران</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings2.rotation}°</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings2.rotation}°</span>
                           </div>
                           <input 
                             type="range" 
@@ -3218,14 +3696,14 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                             max="180" 
                             value={addedFileSettings2.rotation} 
                             onChange={(e) => setAddedFileSettings2(s => ({...s, rotation: Number(e.target.value)}))} 
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
 
                         <div className="flex flex-col gap-1.5">
                           <div className="flex justify-between text-xs text-slate-300">
                             <span>الشفافية</span>
-                            <span className="text-green-400 font-mono text-[11px]">{addedFileSettings2.opacity}%</span>
+                            <span className="text-indigo-400 font-mono text-[11px]">{addedFileSettings2.opacity}%</span>
                           </div>
                           <input 
                             type="range" 
@@ -3233,7 +3711,7 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                             max="100" 
                             value={addedFileSettings2.opacity} 
                             onChange={(e) => setAddedFileSettings2(s => ({...s, opacity: Number(e.target.value)}))} 
-                            className="w-full accent-green-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
+                            className="w-full accent-indigo-500 h-2 bg-white/20 rounded-full appearance-none cursor-pointer border border-white/30 transition-all" 
                           />
                         </div>
                       </div>
@@ -3241,9 +3719,9 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
                   ) : (
                     <button
                       onClick={() => addedFileInputRef.current?.click()}
-                      className="border-2 border-dashed border-slate-800 hover:border-green-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 group transition-all bg-slate-900/20 active:scale-95"
+                      className="border-2 border-dashed border-slate-800 hover:border-indigo-500/50 rounded-2xl p-6 flex flex-col items-center justify-center gap-2 group transition-all bg-slate-900/20 active:scale-95"
                     >
-                      <Plus className="text-slate-500 group-hover:text-green-400 transition-colors" size={24} />
+                      <Plus className="text-slate-500 group-hover:text-indigo-400 transition-colors" size={24} />
                       <span className="text-xs text-slate-400 group-hover:text-slate-300 font-bold">اضغط لإضافة صورة للقطعة الثانية</span>
                     </button>
                   )
@@ -3252,11 +3730,64 @@ export const SVGAViewer: React.FC<SVGAViewerProps> = ({ file, onClear, originalF
 
               {/* Controls */}
               <div className="flex flex-col gap-4">
+                {/* Fit Mode Selector */}
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-xs text-slate-300 font-bold">طريقة ملاءمة الحجم مع الإطار السابق</span>
+                  <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-950/60 rounded-xl border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setEditSettings(s => ({ ...s, fitMode: 'cover' }))}
+                      className={`py-1.5 px-2 text-[11px] font-bold rounded-lg transition-all ${
+                        (editSettings.fitMode || 'cover') === 'cover'
+                          ? 'bg-indigo-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-white hover:bg-white/5'
+                      }`}
+                      title="ملء الإطار بالكامل بنفس حجم ومكان الصورة السابقة دون أي فراغات"
+                    >
+                      ملء كامل (Cover)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditSettings(s => ({ ...s, fitMode: 'contain' }))}
+                      className={`py-1.5 px-2 text-[11px] font-bold rounded-lg transition-all ${
+                        editSettings.fitMode === 'contain'
+                          ? 'bg-indigo-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-white hover:bg-white/5'
+                      }`}
+                      title="يحتوي الصورة بالكامل داخل حدود الإطار الأصلي"
+                    >
+                      احتواء (Fit)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditSettings(s => ({ ...s, fitMode: 'stretch' }))}
+                      className={`py-1.5 px-2 text-[11px] font-bold rounded-lg transition-all ${
+                        editSettings.fitMode === 'stretch'
+                          ? 'bg-indigo-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-white hover:bg-white/5'
+                      }`}
+                      title="يطابق العرض والارتفاع السابق بالضبط 100%"
+                    >
+                      مطابقة تامة
+                    </button>
+                  </div>
+                </div>
+
                 {/* Scale */}
                 <div className="flex flex-col gap-1.5">
-                  <div className="flex justify-between text-xs font-bold text-slate-300">
+                  <div className="flex justify-between items-center text-xs font-bold text-slate-300">
                     <span>حجم القطعة (Scale)</span>
-                    <span className="text-indigo-400">{editSettings.scale}%</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-indigo-400 font-mono">{editSettings.scale}%</span>
+                      <button
+                        type="button"
+                        onClick={() => setEditSettings(s => ({ ...s, scale: 100, offsetX: 0, offsetY: 0 }))}
+                        className="text-[10px] text-slate-400 hover:text-indigo-300 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors"
+                        title="إعادة ضبط الحجم إلى 100% والموضع للمنتصف"
+                      >
+                        إعادة ضبط (100%)
+                      </button>
+                    </div>
                   </div>
                   <input 
                     type="range" 

@@ -44,8 +44,131 @@ input, textarea {
   user-select: text;
 }
 
-input {
+input:not([type="range"]) {
   background-color: transparent !important;
+}
+
+/* Range input styling - visible transparent track */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(71, 85, 105, 0.4);
+  border-radius: 9999px;
+  cursor: pointer;
+  outline: none;
+  --thumb-color: #6366f1; /* Default thumb: Indigo (primary theme of the application) */
+}
+
+/* Base thumb styling using the dynamic --thumb-color */
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background-color: var(--thumb-color, #6366f1);
+  border: 2px solid #0f172a;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: transform 0.1s ease, background-color 0.15s ease;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background-color: var(--thumb-color, #6366f1);
+  border: 2px solid #0f172a;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: transform 0.1s ease, background-color 0.15s ease;
+}
+
+/* 1) WebP Maker page & green/teal accents -> Green/Emerald (#10b981) */
+.webp-creator-container input[type="range"],
+input[type="range"][class*="accent-teal"],
+input[type="range"][class*="accent-emerald"] {
+  --thumb-color: #10b981;
+}
+.webp-creator-container input[type="range"]::-webkit-slider-thumb,
+input[type="range"][class*="accent-teal"]::-webkit-slider-thumb,
+input[type="range"][class*="accent-emerald"]::-webkit-slider-thumb {
+  background-color: #10b981 !important;
+}
+.webp-creator-container input[type="range"]::-moz-range-thumb,
+input[type="range"][class*="accent-teal"]::-moz-range-thumb,
+input[type="range"][class*="accent-emerald"]::-moz-range-thumb {
+  background-color: #10b981 !important;
+}
+
+/* 2) Indigo pages & controls (Format Converter, Video to SVGA, VAB Viewer, PAG Viewer, Image Editor, Matcher) */
+input[type="range"][class*="accent-indigo"] {
+  --thumb-color: #6366f1;
+}
+input[type="range"][class*="accent-indigo"]::-webkit-slider-thumb {
+  background-color: #6366f1 !important;
+}
+input[type="range"][class*="accent-indigo"]::-moz-range-thumb {
+  background-color: #6366f1 !important;
+}
+
+/* 3) Blue pages & controls (SVGA Viewer, MP4 Alpha, APNG Creator) */
+input[type="range"][class*="accent-blue"] {
+  --thumb-color: #3b82f6;
+}
+input[type="range"][class*="accent-blue"]::-webkit-slider-thumb {
+  background-color: #3b82f6 !important;
+}
+input[type="range"][class*="accent-blue"]::-moz-range-thumb {
+  background-color: #3b82f6 !important;
+}
+
+/* 4) Cyan pages & controls (VAP Creator) */
+input[type="range"][class*="accent-cyan"] {
+  --thumb-color: #06b6d4;
+}
+input[type="range"][class*="accent-cyan"]::-webkit-slider-thumb {
+  background-color: #06b6d4 !important;
+}
+input[type="range"][class*="accent-cyan"]::-moz-range-thumb {
+  background-color: #06b6d4 !important;
+}
+
+/* 5) Sky pages & controls */
+input[type="range"][class*="accent-sky"] {
+  --thumb-color: #0ea5e9;
+}
+input[type="range"][class*="accent-sky"]::-webkit-slider-thumb {
+  background-color: #0ea5e9 !important;
+}
+input[type="range"][class*="accent-sky"]::-moz-range-thumb {
+  background-color: #0ea5e9 !important;
+}
+
+/* 6) Pink controls (Glow Intensity, Solid Fill) */
+input[type="range"][class*="accent-pink"] {
+  --thumb-color: #ec4899;
+}
+input[type="range"][class*="accent-pink"]::-webkit-slider-thumb {
+  background-color: #ec4899 !important;
+}
+input[type="range"][class*="accent-pink"]::-moz-range-thumb {
+  background-color: #ec4899 !important;
+}
+
+/* 7) Purple & Violet controls */
+input[type="range"][class*="accent-purple"],
+input[type="range"][class*="accent-violet"] {
+  --thumb-color: #a855f7;
+}
+input[type="range"][class*="accent-purple"]::-webkit-slider-thumb,
+input[type="range"][class*="accent-violet"]::-webkit-slider-thumb {
+  background-color: #a855f7 !important;
+}
+input[type="range"][class*="accent-purple"]::-moz-range-thumb,
+input[type="range"][class*="accent-violet"]::-moz-range-thumb {
+  background-color: #a855f7 !important;
 }
 
 /* Fix for browser autofill turning background white/blue */
@@ -86,5 +209,25 @@ input:-webkit-autofill:active {
 
 .history-scrollbar::-webkit-scrollbar-button {
   display: none;
+}
+
+/* Ensure number input spin buttons (up/down arrows) are crisp and visible in dark mode with standard mouse arrow cursor */
+input[type="number"] {
+  color-scheme: dark;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  opacity: 0.75;
+  cursor: default !important;
+  height: 20px;
+}
+
+input[type="number"]:hover::-webkit-inner-spin-button,
+input[type="number"]:hover::-webkit-outer-spin-button,
+input[type="number"]:active::-webkit-inner-spin-button,
+input[type="number"]:active::-webkit-outer-spin-button {
+  opacity: 1;
+  cursor: default !important;
 }
 

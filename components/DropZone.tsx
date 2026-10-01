@@ -1,5 +1,5 @@
 
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { UploadCloud, FileType } from 'lucide-react';
 
 interface DropZoneProps {
@@ -16,6 +16,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
   subtitle = 'أو انقر لاختيار ملفات من جهازك. يدعم العارض عرض عدة ملفات في نفس الوقت.'
 }) => {
   const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -42,6 +43,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
     if (files.length > 0) {
       onFilesSelect(files);
     }
+    e.target.value = '';
   };
 
   return (
@@ -54,10 +56,10 @@ export const DropZone: React.FC<DropZoneProps> = ({
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      onClick={() => document.getElementById('file-input')?.click()}
+      onClick={() => fileInputRef.current?.click()}
     >
       <input 
-        id="file-input" 
+        ref={fileInputRef} 
         type="file" 
         className="hidden" 
         accept={acceptedExtension}

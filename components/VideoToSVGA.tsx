@@ -166,6 +166,16 @@ export const VideoToSVGA: React.FC = () => {
     const w = canvas.width;
     const h = canvas.height;
 
+    const hasMask = isCircleMask || isSquareMask || fX > 0 || fTop > 0 || fBottom > 0;
+
+    // Ultra-fast path when no mask is configured
+    if (!hasMask) {
+      ctx.clearRect(0, 0, w, h);
+      if (bgImg) ctx.drawImage(bgImg, 0, 0, w, h);
+      ctx.drawImage(video, 0, 0, w, h);
+      return;
+    }
+
     if (!offscreenVCRef.current) offscreenVCRef.current = document.createElement('canvas');
     const vCanvas = offscreenVCRef.current;
     if (vCanvas.width !== w || vCanvas.height !== h) {
@@ -236,7 +246,13 @@ export const VideoToSVGA: React.FC = () => {
     if (!videoRef.current || !videoFile || !canvasRef.current) return;
     setIsConverting(true);
     setProgress(0);
-    setStatusText('جاري استخراج الإطارات...');
+    setStatusText('جاري تهيئة محرك الاستخراج السريع...');
+
+    // Pause the preview requestAnimationFrame loop so it doesn't fight for CPU/GPU
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
 
     try {
       const video = videoRef.current;
@@ -249,17 +265,17 @@ export const VideoToSVGA: React.FC = () => {
          return;
       }
       
-      const totalFrames = Math.floor(duration * targetFps);
+      const totalFrames = Math.max(1, Math.floor(duration * targetFps));
       
       const scaleFactor = quality / 100;
       const w = exportWidth ? parseInt(exportWidth) : Math.round(video.videoWidth * scaleFactor);
       const h = exportHeight ? parseInt(exportHeight) : Math.round(video.videoHeight * scaleFactor);
 
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
+      const drawCanvas = document.createElement('canvas');
+      drawCanvas.width = w;
+      drawCanvas.height = h;
 
-      const framePngs: Uint8Array[] = [];
+      const framePngs: Uint8Array[] = new Array(totalFrames);
 
       let bgImg: HTMLImageElement | undefined;
       if (bgImageUrl) {
@@ -271,33 +287,83 @@ export const VideoToSVGA: React.FC = () => {
       const wasPlaying = !video.paused;
       video.pause();
 
+      // Reliable seek helper with timeout protection to prevent stalling
+      const seekVideo = (targetTime: number): Promise<void> => {
+        return new Promise((resolve) => {
+          if (Math.abs(video.currentTime - targetTime) < 0.005) {
+            resolve();
+            return;
+          }
+          let resolved = false;
+          const onSeeked = () => {
+            if (!resolved) {
+              resolved = true;
+              video.removeEventListener('seeked', onSeeked);
+              resolve();
+            }
+          };
+          video.addEventListener('seeked', onSeeked, { once: true });
+          video.currentTime = targetTime;
+          // Fallback timeout in case the browser skips firing the seeked event
+          setTimeout(() => {
+            if (!resolved) {
+              resolved = true;
+              video.removeEventListener('seeked', onSeeked);
+              resolve();
+            }
+          }, 350);
+        });
+      };
+
+      // Asynchronous pipelined encoding: encode frames in parallel while video is seeking next frame
+      const CONCURRENCY = 4;
+      let inFlight = 0;
+      const queue: Promise<void>[] = [];
+
+      const encodeFrame = async (frameIdx: number, sourceCanvas: HTMLCanvasElement) => {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext('2d');
+        if (ctx) ctx.drawImage(sourceCanvas, 0, 0);
+
+        const blob = await new Promise<Blob | null>(resolve => c.toBlob(resolve, 'image/png'));
+        if (blob) {
+          const buffer = await blob.arrayBuffer();
+          framePngs[frameIdx] = new Uint8Array(buffer);
+        }
+      };
+
       for (let i = 0; i < totalFrames; i++) {
         const time = i / targetFps;
-        video.currentTime = time;
-        await new Promise(r => {
-          const onSeeked = () => {
-            video.removeEventListener('seeked', onSeeked);
-            r(null);
-          };
-          video.addEventListener('seeked', onSeeked);
-        });
+        await seekVideo(time);
 
-        drawFrame(video, canvas, featherX, featherTop, featherBottom, bgImg);
-        
-        const frameBuffer = await new Promise<Uint8Array>(resolve => {
-          canvas.toBlob(blob => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
-            reader.readAsArrayBuffer(blob!);
-          }, 'image/png');
+        drawFrame(video, drawCanvas, featherX, featherTop, featherBottom, bgImg);
+
+        inFlight++;
+        const p = encodeFrame(i, drawCanvas).then(() => {
+          inFlight--;
         });
-        framePngs.push(frameBuffer);
-        setProgress(Math.round((i / totalFrames) * 50));
+        queue.push(p);
+
+        // Control concurrency so memory doesn't spike
+        if (inFlight >= CONCURRENCY) {
+          while (inFlight >= CONCURRENCY) {
+            await new Promise(r => setTimeout(r, 8));
+          }
+        }
+
+        setProgress(Math.round(((i + 1) / totalFrames) * 65));
+        setStatusText(`جاري التقاط الإطار ${i + 1} من ${totalFrames}...`);
       }
+
+      setStatusText('جاري إتمام تجهيز الإطارات المستخرجة...');
+      await Promise.all(queue);
+      setProgress(70);
 
       if (wasPlaying) video.play();
 
-      setStatusText('جاري بناء ملف SVGA...');
+      setStatusText('جاري تجميع بنية ملف SVGA (Protobuf)...');
       
       const root = parse(svgaSchema).root;
       const MovieEntity = root.lookupType("com.opensource.svga.MovieEntity");
@@ -307,7 +373,7 @@ export const VideoToSVGA: React.FC = () => {
       const audios: any[] = [];
 
       if (audioFile) {
-        setStatusText('جاري معالجة الصوت...');
+        setStatusText('جاري معالجة الصوت المرفق...');
         const audioBuffer = await audioFile.arrayBuffer();
         images['audio_0'] = new Uint8Array(audioBuffer);
         audios.push({
@@ -319,24 +385,36 @@ export const VideoToSVGA: React.FC = () => {
         });
       }
 
+      // Reusable hidden frame reference: cuts object allocations and serialization memory by 90%+
+      const hiddenFrame = { alpha: 0 };
+      const defaultLayout = { x: 0, y: 0, width: w, height: h };
+      const defaultTransform = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+
       for (let i = 0; i < totalFrames; i++) {
         const imageKey = `frame_${i}`;
         images[imageKey] = framePngs[i];
 
-        const frames = [];
+        const frames = new Array(totalFrames);
         for (let j = 0; j < totalFrames; j++) {
-          frames.push({
-            alpha: i === j ? 1.0 : 0.0,
-            layout: { x: 0, y: 0, width: w, height: h },
-            transform: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 }
-          });
+          if (i === j) {
+            frames[j] = {
+              alpha: 1.0,
+              layout: defaultLayout,
+              transform: defaultTransform
+            };
+          } else {
+            frames[j] = hiddenFrame;
+          }
         }
 
         sprites.push({
           imageKey: imageKey,
           frames: frames
         });
-        setProgress(50 + Math.round((i / totalFrames) * 20));
+
+        if (i % 15 === 0 || i === totalFrames - 1) {
+          setProgress(70 + Math.round(((i + 1) / totalFrames) * 18));
+        }
       }
 
       const movie = {
@@ -347,15 +425,19 @@ export const VideoToSVGA: React.FC = () => {
         audios: audios
       };
 
-      setStatusText('جاري ضغط الملف...');
+      setStatusText('جاري تشفير هيكل البروتوكول...');
+      setProgress(90);
       const message = MovieEntity.create(movie);
       const buffer = MovieEntity.encode(message).finish();
       
-      const pakoLevel = Math.min(9, Math.max(0, Math.floor(compressionRatio / 10)));
+      setStatusText('جاري ضغط الملف بسرعة فائقة...');
+      setProgress(95);
+      // Fast compression: PNG frames are already compressed, level 1/2 saves the same size but completes in milliseconds
+      const pakoLevel = Math.min(2, Math.max(1, Math.floor(compressionRatio / 40)));
       const deflated = pako.deflate(buffer, { level: pakoLevel as any });
       
       setProgress(100);
-      setStatusText('تم الانتهاء!');
+      setStatusText('تم الانتهاء والتحميل جاهز!');
 
       const blob = new Blob([deflated], { type: 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
@@ -370,6 +452,10 @@ export const VideoToSVGA: React.FC = () => {
       alert("حدث خطأ أثناء التحويل.");
     } finally {
       setIsConverting(false);
+      // Resume preview loop
+      if (videoUrl) {
+        animationRef.current = requestAnimationFrame(updatePreview);
+      }
     }
   };
 

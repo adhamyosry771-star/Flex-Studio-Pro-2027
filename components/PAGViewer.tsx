@@ -995,7 +995,7 @@ export const PAGViewer: React.FC<PAGViewerProps> = ({ file, onClear, originalFil
       <div className="flex flex-col h-[750px] bg-slate-900/50 overflow-hidden shadow-2xl relative border border-slate-800/50 rounded-[2.5rem]">
         <div className="px-8 py-6 border-b border-slate-800 flex items-center justify-between bg-slate-900/50 z-30">
           <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+            <div className="w-2 h-2 rounded-full bg-blue-500"></div>
             <h4 className="text-sm font-bold text-white truncate max-w-[250px]">{file.name}</h4>
           </div>
           <div className="flex items-center gap-2 flex-wrap justify-end">

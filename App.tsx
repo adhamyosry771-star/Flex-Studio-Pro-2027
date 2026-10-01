@@ -2,6 +2,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { Header, ViewType } from './components/Header';
 import { SVGAViewer } from './components/SVGAViewer';
+import { SVGAGridViewer } from './components/SVGAGridViewer';
 import { PAGViewer } from './components/PAGViewer';
 import { VABViewer } from './components/VABViewer';
 import { VAPCreator } from './components/VAPCreator';
@@ -12,6 +13,8 @@ import { ImageMatcher } from './components/ImageMatcher';
 import { ImageEditor } from './components/ImageEditor';
 import { FormatConverter } from './components/FormatConverter';
 import { APNGCreator } from './components/APNGCreator';
+import { WebPCreator } from './components/WebPCreator';
+import { MP3Converter } from './components/MP3Converter';
 import { AfterEffectsStudio } from './components/AfterEffectsStudio';
 import { AuthProvider, useAuth, isUserAdminOrOwner } from './components/AuthContext';
 import { UnderDevelopmentModal } from './components/UnderDevelopmentModal';
@@ -151,6 +154,7 @@ const AppContent: React.FC = () => {
   const [history, setHistory] = useState<SVGAFileExtended[]>([]);
   const [currentView, setCurrentView] = useState<ViewType>('viewer');
   const [vabInitialFile, setVabInitialFile] = useState<File | null>(null);
+  const [forceGridView, setForceGridView] = useState(false);
   const [showSubModal, setShowSubModal] = useState(false);
   const [modalConfig, setModalConfig] = useState<{
     isOpen: boolean;
@@ -522,6 +526,14 @@ const AppContent: React.FC = () => {
               <motion.div key="apng-creator" className="relative w-full" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} onClickCapture={handlePremiumClickCapture}>
                 <APNGCreator />
               </motion.div>
+            ) : currentView === 'webp-creator' ? (
+              <motion.div key="webp-creator" className="relative w-full" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} onClickCapture={handlePremiumClickCapture}>
+                <WebPCreator />
+              </motion.div>
+            ) : currentView === 'mp3-converter' ? (
+              <motion.div key="mp3-converter" className="relative w-full" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} onClickCapture={handlePremiumClickCapture}>
+                <MP3Converter />
+              </motion.div>
             ) : currentView === 'after-effects' ? (
               isOwner ? (
                 <motion.div key="after-effects" className="relative w-full" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} onClickCapture={handlePremiumClickCapture}>
@@ -678,32 +690,37 @@ const AppContent: React.FC = () => {
                     </div>
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-8">
-                    <div className={`grid gap-8 ${currentFiles.length === 1 ? 'grid-cols-1' : currentFiles.length === 2 ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1 lg:grid-cols-2 xl:grid-cols-3'}`}>
-                      {currentFiles.map((file, idx) => (
-                        <div key={`${file.name}-${idx}`} className="flex flex-col gap-4">
-                          <SVGAViewer 
-                            file={file} 
-                            onClear={() => setCurrentFiles(prev => prev.filter(f => f !== file))} 
-                            originalFile={file.rawFile}
-                          />
-      
-                          <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-4">
-                            <div className="grid grid-cols-2 gap-4">
-                              <div>
-                                <p className="text-[10px] text-slate-500 mb-1 uppercase">اسم الملف</p>
-                                <p className="text-xs font-bold truncate text-white" title={file.name}>{file.name}</p>
-                              </div>
-                              <div>
-                                <p className="text-[10px] text-slate-500 mb-1 uppercase">حجم البيانات</p>
-                                <p className="text-xs font-bold text-white">{formatSize(file.size)}</p>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
+                  <SVGAGridViewer
+                    files={currentFiles}
+                    onAddFiles={handleFilesUpload}
+                    onRemoveFile={(file) => {
+                      setCurrentFiles(prev => prev.filter(f => f !== file));
+                    }}
+                    onRenameFile={(file, newName) => {
+                      setCurrentFiles(prev => prev.map(f => {
+                        if (f === file) {
+                          let updatedRawFile = f.rawFile;
+                          if (f.rawFile) {
+                            try {
+                              updatedRawFile = new File([f.rawFile], newName, {
+                                type: f.rawFile.type,
+                                lastModified: f.rawFile.lastModified
+                              });
+                            } catch (e) {}
+                          }
+                          return {
+                            ...f,
+                            name: newName,
+                            rawFile: updatedRawFile || f.rawFile
+                          };
+                        }
+                        return f;
+                      }));
+                    }}
+                    onClearAll={() => {
+                      setCurrentFiles([]);
+                    }}
+                  />
                 )}
               </motion.div>
             )}

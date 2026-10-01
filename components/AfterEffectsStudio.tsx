@@ -33,7 +33,6 @@ import {
   Sliders,
   Grid,
   Palette,
-  Crosshair,
   Layers,
   Film,
   ZoomIn,
@@ -45,8 +44,9 @@ import {
   Save,
   HelpCircle,
   Key,
-  Shield,
-  Sun
+  Sun,
+  AlertCircle,
+  Sparkles
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import pako from 'pako';
@@ -56,6 +56,25 @@ import * as UPNG from 'upng-js';
 import { GIFEncoder, quantize, applyPalette } from 'gifenc';
 import JSZip from 'jszip';
 import { SVGAFileExtended } from '../types';
+
+// Additional Layer / Child Overlay Config (دمج كقناع Alpha Matte / مسح ضوئي متواصل)
+export interface AdditionalLayerConfig {
+  id: string;
+  name: string;
+  imageSrc: string;
+  imageElement?: HTMLImageElement | null;
+  enabled: boolean;
+  clipToParent: boolean; // default true: source-atop (Alpha Matte clipping)
+  blendMode: 'source-atop' | 'screen' | 'lighter' | 'overlay' | 'source-over';
+  scale: number; // percentage (10 to 300, default 75)
+  opacity: number; // percentage (0 to 100, default 100)
+  motionMode: 'continuous_sweep' | 'loop_bounce' | 'custom_offset';
+  sweepDirection: 'diagonal' | 'horizontal' | 'vertical';
+  sweepSpeed: number; // duration in frames (default 30)
+  offsetX: number;
+  offsetY: number;
+  rotation: number;
+}
 
 // Keyframe interface for animatable properties
 export interface Keyframe<T = number> {
@@ -114,6 +133,10 @@ export interface AELayer {
   fontColor?: string;
   fontFamily?: string;
 
+  // Alpha Matte Masking & Parent Relationship (دمج كقناع داخل قطعة أخرى)
+  clipToLayerId?: string; // If set, this layer is clipped inside the specified parent layer
+  blendMode?: 'source-atop' | 'screen' | 'lighter' | 'overlay' | 'source-over';
+
   // Image Specific Properties
   imageSrc?: string;
   imageElement?: HTMLImageElement | null;
@@ -132,6 +155,95 @@ interface AfterEffectsStudioProps {
   onOpenInViewer?: (file: SVGAFileExtended) => void;
 }
 
+interface NumericInputProps {
+  value: number;
+  onChange: (val: number) => void;
+  className?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  defaultValue?: number;
+  placeholder?: string;
+}
+
+const NumericInput: React.FC<NumericInputProps> = ({
+  value,
+  onChange,
+  className,
+  min,
+  max,
+  step = 1,
+  defaultValue = 0,
+  placeholder
+}) => {
+  const [text, setText] = useState<string>(() => (isNaN(value) ? '' : String(value)));
+  const [isFocused, setIsFocused] = useState(false);
+
+  useEffect(() => {
+    if (!isFocused) {
+      setText(isNaN(value) ? '' : String(value));
+    }
+  }, [value, isFocused]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    setText(raw);
+
+    // Allow user to clear the field completely or type minus sign without forcing 0
+    if (raw === '' || raw === '-' || raw === '+') {
+      return;
+    }
+
+    const parsed = parseFloat(raw);
+    if (!isNaN(parsed)) {
+      let finalVal = parsed;
+      if (min !== undefined && finalVal < min) finalVal = min;
+      if (max !== undefined && finalVal > max) finalVal = max;
+      onChange(finalVal);
+    }
+  };
+
+  const handleBlur = () => {
+    setIsFocused(false);
+    if (text === '' || text === '-' || text === '+' || isNaN(parseFloat(text))) {
+      setText(String(defaultValue));
+      onChange(defaultValue);
+    } else {
+      const parsed = parseFloat(text);
+      let finalVal = parsed;
+      if (min !== undefined && finalVal < min) finalVal = min;
+      if (max !== undefined && finalVal > max) finalVal = max;
+      setText(String(finalVal));
+      onChange(finalVal);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      (e.target as HTMLInputElement).blur();
+    }
+  };
+
+  return (
+    <input
+      type="number"
+      value={text}
+      min={min}
+      max={max}
+      step={step}
+      placeholder={placeholder}
+      onFocus={(e) => {
+        setIsFocused(true);
+        e.target.select();
+      }}
+      onChange={handleChange}
+      onBlur={handleBlur}
+      onKeyDown={handleKeyDown}
+      className={className}
+    />
+  );
+};
+
 export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenInViewer }) => {
   // Project State: whether a composition is currently open
   const [hasProject, setHasProject] = useState<boolean>(false);
@@ -149,13 +261,14 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
   // Modal temporary state for Comp Settings
   const [modalName, setModalName] = useState('Comp 1');
-  const [modalWidth, setModalWidth] = useState(750);
-  const [modalHeight, setModalHeight] = useState(750);
+  const [modalWidth, setModalWidth] = useState<number | ''>('');
+  const [modalHeight, setModalHeight] = useState<number | ''>('');
   const [modalFps, setModalFps] = useState(30);
-  const [modalTotalFrames, setModalTotalFrames] = useState(90);
+  const [modalTotalFrames, setModalTotalFrames] = useState<number | ''>(90);
   const [modalDurationSec, setModalDurationSec] = useState(3);
   const [modalDurationMode, setModalDurationMode] = useState<'frames' | 'seconds'>('frames');
   const [modalBg, setModalBg] = useState('#000000');
+  const [compSettingsError, setCompSettingsError] = useState<string | null>(null);
 
   // Layers stack (User builds from scratch! Zero pre-loaded templates)
   const [layers, setLayers] = useState<AELayer[]>([]);
@@ -173,16 +286,17 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
   const isPlayingRef = useRef<boolean>(false);
   isPlayingRef.current = isPlaying;
   const rulerRef = useRef<HTMLDivElement>(null);
+  const layerListScrollRef = useRef<HTMLDivElement>(null);
+  const tracksScrollRef = useRef<HTMLDivElement>(null);
 
   // Viewport Settings
   const [zoomLevel, setZoomLevel] = useState<number>(1); // 1 = 100%
   const [showTransparencyGrid, setShowTransparencyGrid] = useState<boolean>(true);
-  const [showSafeGuides, setShowSafeGuides] = useState<boolean>(false);
-  const [showAvatarGuide, setShowAvatarGuide] = useState<boolean>(false);
   const [activeTool, setActiveTool] = useState<'select' | 'hand' | 'rotate' | 'shape' | 'text'>('select');
 
   // Export State
   const [exportModalOpen, setExportModalOpen] = useState<boolean>(false);
+  const [exportCategory, setExportCategory] = useState<'primary' | 'secondary'>('primary');
   const [exporting, setExporting] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<number>(0);
   const [exportStatusText, setExportStatusText] = useState<string>('');
@@ -258,29 +372,63 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     if (stageW <= 0 || stageH <= 0) return;
     const scaleW = stageW / compSettings.width;
     const scaleH = stageH / compSettings.height;
-    const bestScale = Math.min(scaleW, scaleH, 1.25); // cap at 125% max auto zoom
-    setZoomLevel(Math.max(0.2, Number(bestScale.toFixed(2))));
+    // In After Effects, "Fit" scales up or down to comfortably fill the viewport window
+    const bestScale = Math.min(scaleW, scaleH);
+    // Best scale capped at 1.0 (100% original size maximum)
+    const clampedScale = Math.max(0.15, Math.min(1.0, bestScale));
+    setZoomLevel(Number(clampedScale.toFixed(2)));
   }, [compSettings.width, compSettings.height]);
 
-  // Automatically fit on project open or dimension change
+  // Mouse wheel zoom on stage container (smooth desktop After Effects zoom experience)
   useEffect(() => {
-    if (hasProject) {
-      // Small timeout to allow container layout pass
-      const timer = setTimeout(() => {
-        fitToView();
-      }, 50);
-      return () => clearTimeout(timer);
-    }
-  }, [hasProject, compSettings.width, compSettings.height, fitToView]);
+    const container = stageContainerRef.current;
+    if (!container) return;
 
-  // Scrub timeline to frame from mouse clientX
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.88;
+      setZoomLevel(prev => {
+        const next = Number((prev * zoomFactor).toFixed(2));
+        return Math.max(0.15, Math.min(1.0, next));
+      });
+    };
+
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      container.removeEventListener('wheel', handleWheel);
+    };
+  }, []);
+
+  // Synchronized scroll handlers between layer list and keyframe tracks
+  const handleTracksScroll = useCallback(() => {
+    if (tracksScrollRef.current && layerListScrollRef.current) {
+      layerListScrollRef.current.scrollTop = tracksScrollRef.current.scrollTop;
+    }
+  }, []);
+
+  const handleLayerListScroll = useCallback(() => {
+    if (tracksScrollRef.current && layerListScrollRef.current) {
+      tracksScrollRef.current.scrollTop = layerListScrollRef.current.scrollTop;
+    }
+  }, []);
+
+  // Helper to calculate timeline horizontal position percentage with inset so diamonds (10px wide) are never clipped at 0 or 100%
+  const getTimelineLeftPercent = useCallback((frame: number) => {
+    const total = Math.max(1, compSettings.totalFrames);
+    const ratio = Math.max(0, Math.min(1, frame / total));
+    return `calc(8px + (100% - 16px) * ${ratio})`;
+  }, [compSettings.totalFrames]);
+
+  // Scrub timeline to frame from mouse clientX (accounting for the 8px inset so start/end frame match precisely)
   const updateScrubFrame = useCallback((clientX: number) => {
     if (!rulerRef.current) return;
     const rect = rulerRef.current.getBoundingClientRect();
-    const clickX = clientX - rect.left;
-    const pct = Math.max(0, Math.min(1, clickX / rect.width));
-    const targetF = Math.round(pct * (compSettings.totalFrames - 1));
-    setCurrentFrame(targetF);
+    const padding = 8;
+    const usableWidth = Math.max(1, rect.width - padding * 2);
+    const clickX = clientX - rect.left - padding;
+    const pct = Math.max(0, Math.min(1, clickX / usableWidth));
+    const targetF = Math.round(pct * compSettings.totalFrames);
+    setCurrentFrame(Math.max(0, Math.min(compSettings.totalFrames, targetF)));
   }, [compSettings.totalFrames]);
 
   // Global mouse move & up listeners for scrubbing
@@ -300,25 +448,257 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     };
   }, [isScrubbing, updateScrubFrame]);
 
-  // Window resize observer to keep canvas responsive
+  // Keyframe moving & dragging state (Double-click or drag to reposition)
+  const [draggingKeyframe, setDraggingKeyframe] = useState<{
+    layerId: string;
+    property: 'position' | 'scale' | 'rotation' | 'opacity';
+    originalFrame: number;
+    currentDragFrame: number;
+    isConfirmedDrag: boolean;
+    startX: number;
+    mode: 'drag' | 'double_click';
+    startTime: number;
+  } | null>(null);
+
+  // Calculate frame number from clientX coordinate
+  const calculateFrameFromClientX = useCallback((clientX: number) => {
+    const el = tracksScrollRef.current || rulerRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    const padding = 8;
+    const usableWidth = Math.max(1, rect.width - padding * 2);
+    const clickX = clientX - rect.left - padding;
+    const pct = Math.max(0, Math.min(1, clickX / usableWidth));
+    const targetF = Math.round(pct * compSettings.totalFrames);
+    return Math.max(0, Math.min(compSettings.totalFrames, targetF));
+  }, [compSettings.totalFrames]);
+
+  // Move a keyframe to a new frame position
+  const moveKeyframe = useCallback((
+    layerId: string,
+    property: 'position' | 'scale' | 'rotation' | 'opacity',
+    originalFrame: number,
+    newFrame: number
+  ) => {
+    setLayers(prev => prev.map(layer => {
+      if (layer.id !== layerId) return layer;
+
+      const propKey = 
+        property === 'position' ? 'positionKeyframes' :
+        property === 'scale' ? 'scaleKeyframes' :
+        property === 'rotation' ? 'rotationKeyframes' :
+        'opacityKeyframes';
+
+      const currentList: Keyframe<any>[] = [...(layer[propKey] as Keyframe<any>[])];
+      const targetKf = currentList.find(k => k.frame === originalFrame);
+      if (!targetKf) return layer;
+
+      // Filter out original frame and any keyframe already at newFrame
+      const filtered = currentList.filter(k => k.frame !== originalFrame && k.frame !== newFrame);
+      
+      // Insert updated keyframe at newFrame
+      filtered.push({
+        ...targetKf,
+        frame: newFrame
+      });
+
+      // Keep sorted by frame ascending
+      filtered.sort((a, b) => a.frame - b.frame);
+
+      return {
+        ...layer,
+        [propKey]: filtered
+      };
+    }));
+
+    setCurrentFrame(newFrame);
+    setSelectedLayerId(layerId);
+  }, []);
+
+  // Handle mousedown on a keyframe
+  const handleKeyframeMouseDown = useCallback((
+    layerId: string,
+    property: 'position' | 'scale' | 'rotation' | 'opacity',
+    frame: number,
+    e: React.MouseEvent
+  ) => {
+    e.stopPropagation();
+    setSelectedLayerId(layerId);
+    setDraggingKeyframe({
+      layerId,
+      property,
+      originalFrame: frame,
+      currentDragFrame: frame,
+      isConfirmedDrag: false,
+      startX: e.clientX,
+      mode: 'drag',
+      startTime: Date.now()
+    });
+  }, []);
+
+  // Handle double-click on a keyframe to activate positioning mode
+  const handleKeyframeDoubleClick = useCallback((
+    layerId: string,
+    property: 'position' | 'scale' | 'rotation' | 'opacity',
+    frame: number,
+    e: React.MouseEvent
+  ) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setSelectedLayerId(layerId);
+    setDraggingKeyframe({
+      layerId,
+      property,
+      originalFrame: frame,
+      currentDragFrame: frame,
+      isConfirmedDrag: true,
+      startX: e.clientX,
+      mode: 'double_click',
+      startTime: Date.now()
+    });
+  }, []);
+
+  // Window listeners for moving/dropping keyframes
   useEffect(() => {
-    const handleResize = () => {
-      if (hasProject) {
-        fitToView();
+    if (!draggingKeyframe) return;
+
+    const onMouseMove = (e: MouseEvent) => {
+      const newFrame = calculateFrameFromClientX(e.clientX);
+      setDraggingKeyframe(prev => {
+        if (!prev) return null;
+        const dist = Math.abs(e.clientX - prev.startX);
+        const isConfirmed = prev.isConfirmedDrag || dist > 4 || prev.mode === 'double_click';
+        return {
+          ...prev,
+          currentDragFrame: newFrame,
+          isConfirmedDrag: isConfirmed
+        };
+      });
+    };
+
+    const onMouseUp = () => {
+      setDraggingKeyframe(prev => {
+        if (!prev) return null;
+        // In double-click mode, if mouseup happened immediately after the double click (< 200ms), keep it active so the user can move freely and click to drop
+        if (prev.mode === 'double_click' && Date.now() - prev.startTime < 200) {
+          return prev;
+        }
+
+        if (prev.isConfirmedDrag) {
+          moveKeyframe(prev.layerId, prev.property, prev.originalFrame, prev.currentDragFrame);
+        } else {
+          setCurrentFrame(prev.originalFrame);
+          setSelectedLayerId(prev.layerId);
+        }
+        return null;
+      });
+    };
+
+    const onClick = () => {
+      setDraggingKeyframe(prev => {
+        if (!prev) return null;
+        if (prev.mode === 'double_click' && Date.now() - prev.startTime >= 200) {
+          moveKeyframe(prev.layerId, prev.property, prev.originalFrame, prev.currentDragFrame);
+          return null;
+        }
+        return prev;
+      });
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setDraggingKeyframe(null);
       }
     };
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [hasProject, fitToView]);
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('click', onClick, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('click', onClick, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [draggingKeyframe, calculateFrameFromClientX, moveKeyframe]);
 
   // Canvas Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animReqRef = useRef<number | null>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Get current selected layer
   const selectedLayer = useMemo(() => {
     return layers.find(l => l.id === selectedLayerId) || null;
   }, [layers, selectedLayerId]);
+
+  // Additional Masked Child Layer State (دمج طبقة إضافية مباشرة من الجهاز كقناع Alpha Matte كامل الحركة)
+  const additionalLayerFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Upload an icon/piece directly from user device and attach as a masked layer (Alpha Matte)
+  const handleUploadMaskedChildLayer = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!selectedLayerId || !e.target.files || !e.target.files[0]) return;
+    const parentLayer = layers.find(l => l.id === selectedLayerId);
+    if (!parentLayer) return;
+
+    const file = e.target.files[0];
+    const url = URL.createObjectURL(file);
+    const pieceName = file.name.replace(/\.[^/.]+$/, '');
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const childLayerId = `layer-masked-${Date.now()}`;
+      
+      const newLayer: AELayer = {
+        id: childLayerId,
+        name: `${parentLayer.name} - ${pieceName}`,
+        kind: 'image',
+        visible: true,
+        locked: false,
+        colorLabel: 'purple',
+        expanded: true,
+        // Start centered inside the parent layer (local 0,0 relative to parent)
+        position: { x: 0, y: 0 },
+        scale: 75,
+        rotation: 0,
+        opacity: 100,
+        // Keyframing only enabled when user clicks clock icon
+        animatingPosition: false,
+        positionKeyframes: [],
+        animatingScale: false,
+        scaleKeyframes: [],
+        animatingRotation: false,
+        rotationKeyframes: [],
+        animatingOpacity: false,
+        opacityKeyframes: [],
+        imageSrc: url,
+        imageElement: img,
+        width: img.naturalWidth || 150,
+        height: img.naturalHeight || 150,
+        clipToLayerId: parentLayer.id, // MASKED INSIDE PARENT!
+        blendMode: 'source-atop'
+      };
+
+      setLayers(prev => {
+        // Place right above parent in layer stack
+        const pIdx = prev.findIndex(l => l.id === parentLayer.id);
+        const next = [...prev];
+        if (pIdx >= 0) {
+          next.splice(pIdx, 0, newLayer);
+        } else {
+          next.unshift(newLayer);
+        }
+        return next;
+      });
+
+      // Select it immediately so handles & bounding box appear in viewport
+      setSelectedLayerId(childLayerId);
+    };
+    img.src = url;
+    e.target.value = '';
+  }, [selectedLayerId, layers]);
 
   // Handle Duration & Frame calculations in Modal
   const handleFpsChange = (newFps: number) => {
@@ -342,33 +722,53 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     setModalTotalFrames(Math.round(val * modalFps));
   };
 
-  // Preset Resolution choices for fast setup
-  const setResolutionPreset = (w: number, h: number, defaultFrames = 90, fpsChoice = 30) => {
-    setModalWidth(w);
-    setModalHeight(h);
-    setModalFps(fpsChoice);
-    setModalTotalFrames(defaultFrames);
-    setModalDurationSec(Number((defaultFrames / fpsChoice).toFixed(2)));
-  };
-
   // Commit and Open Composition
   const handleCreateComposition = () => {
+    const widthNum = modalWidth === '' ? NaN : Number(modalWidth);
+    const heightNum = modalHeight === '' ? NaN : Number(modalHeight);
+
+    if (modalWidth === '' || isNaN(widthNum) || widthNum <= 0 || modalHeight === '' || isNaN(heightNum) || heightNum <= 0) {
+      setCompSettingsError('يرجى تحديد العرض والارتفاع أولاً');
+      return;
+    }
+
+    setCompSettingsError(null);
+
+    const finalWidth = Math.max(10, Math.round(widthNum));
+    const finalHeight = Math.max(10, Math.round(heightNum));
+    const finalFrames = modalTotalFrames === '' || isNaN(Number(modalTotalFrames)) ? 90 : Math.max(1, Number(modalTotalFrames));
+
     setCompSettings({
       name: modalName || 'Comp 1',
-      width: Math.max(100, modalWidth),
-      height: Math.max(100, modalHeight),
+      width: finalWidth,
+      height: finalHeight,
       fps: modalFps,
-      totalFrames: Math.max(1, modalTotalFrames),
+      totalFrames: finalFrames,
       backgroundColor: modalBg
     });
     setHasProject(true);
     setShowCompSettingsModal(false);
     setCurrentFrame(0);
     setIsPlaying(false);
-    setTimeout(() => {
-      fitToView();
-    }, 60);
+    // Open directly at 100% Original Size (1:1) as requested!
+    setZoomLevel(1);
   };
+
+  // Sync modal state whenever opening composition settings
+  useEffect(() => {
+    if (showCompSettingsModal) {
+      setCompSettingsError(null);
+      if (hasProject) {
+        setModalName(compSettings.name);
+        setModalWidth(compSettings.width);
+        setModalHeight(compSettings.height);
+        setModalFps(compSettings.fps);
+        setModalTotalFrames(compSettings.totalFrames);
+        setModalDurationSec(Number((compSettings.totalFrames / compSettings.fps).toFixed(2)));
+        setModalBg(compSettings.backgroundColor);
+      }
+    }
+  }, [showCompSettingsModal]);
 
   // Keyboard shortcut Ctrl+K to toggle composition settings
   useEffect(() => {
@@ -453,6 +853,35 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     return { pos, scale, rotation, opacity };
   }, []);
 
+  // Get evaluated transform in world canvas coordinate space (handles parent-child Alpha Matte relationship)
+  const getLayerWorldTransform = useCallback((layer: AELayer, frame: number) => {
+    const local = evaluateLayerAtFrame(layer, frame);
+    if (!layer.clipToLayerId) {
+      return local;
+    }
+    const parent = layers.find(l => l.id === layer.clipToLayerId);
+    if (!parent) {
+      return local;
+    }
+    const pTrans = evaluateLayerAtFrame(parent, frame);
+    const pRad = (pTrans.rotation * Math.PI) / 180;
+    const ps = pTrans.scale / 100;
+
+    // Transform local pos by parent rotation & scale
+    const rx = (local.pos.x * Math.cos(pRad) - local.pos.y * Math.sin(pRad)) * ps;
+    const ry = (local.pos.x * Math.sin(pRad) + local.pos.y * Math.cos(pRad)) * ps;
+
+    return {
+      pos: {
+        x: pTrans.pos.x + rx,
+        y: pTrans.pos.y + ry
+      },
+      scale: (local.scale * pTrans.scale) / 100,
+      rotation: pTrans.rotation + local.rotation,
+      opacity: (local.opacity * pTrans.opacity) / 100
+    };
+  }, [evaluateLayerAtFrame, layers]);
+
   // Helper to determine intrinsic / configured bounds for any layer
   const getLayerDimensions = useCallback((layer: AELayer, compW: number, compH: number) => {
     switch (layer.kind) {
@@ -492,7 +921,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     compW: number,
     compH: number
   ) => {
-    const { pos, scale, rotation } = evaluateLayerAtFrame(layer, frame);
+    const { pos, scale, rotation } = getLayerWorldTransform(layer, frame);
     const { width: lw, height: lh } = getLayerDimensions(layer, compW, compH);
     const halfW = lw / 2;
     const halfH = lh / 2;
@@ -558,7 +987,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     ctx.stroke();
 
     ctx.restore();
-  }, [evaluateLayerAtFrame, getLayerDimensions]);
+  }, [getLayerWorldTransform, getLayerDimensions]);
 
   // Hit-test a layer in canvas coordinate space
   const hitTestLayer = useCallback((
@@ -571,7 +1000,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
   ): boolean => {
     if (!layer.visible || layer.locked) return false;
 
-    const { pos, scale, rotation, opacity } = evaluateLayerAtFrame(layer, frame);
+    const { pos, scale, rotation, opacity } = getLayerWorldTransform(layer, frame);
     if (opacity <= 0) return false;
 
     const cx = compW / 2 + pos.x;
@@ -598,7 +1027,59 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     const halfH = height / 2;
 
     return Math.abs(lx) <= halfW && Math.abs(ly) <= halfH;
-  }, [evaluateLayerAtFrame, getLayerDimensions]);
+  }, [getLayerWorldTransform, getLayerDimensions]);
+
+  // Draw a masked child layer inside its parent's coordinate space (Alpha Matte)
+  const drawChildLayerInsideParent = useCallback((
+    ctx: CanvasRenderingContext2D,
+    child: AELayer,
+    parent: AELayer,
+    frame: number,
+    compW: number,
+    compH: number
+  ) => {
+    if (!child.visible) return;
+    const pTrans = evaluateLayerAtFrame(parent, frame);
+    const cTrans = evaluateLayerAtFrame(child, frame);
+    if (cTrans.opacity <= 0 || pTrans.opacity <= 0) return;
+
+    ctx.save();
+
+    // 1. Position at parent layer origin and orientation
+    const pcx = compW / 2 + pTrans.pos.x;
+    const pcy = compH / 2 + pTrans.pos.y;
+    ctx.translate(pcx, pcy);
+    ctx.rotate((pTrans.rotation * Math.PI) / 180);
+    const ps = pTrans.scale / 100;
+    ctx.scale(ps, ps);
+
+    // 2. Apply child layer's local position, rotation, and scale inside parent
+    ctx.translate(cTrans.pos.x, cTrans.pos.y);
+    ctx.rotate((cTrans.rotation * Math.PI) / 180);
+    const cs = cTrans.scale / 100;
+    ctx.scale(cs, cs);
+    ctx.globalAlpha = Math.max(0, Math.min(1, (cTrans.opacity / 100) * (pTrans.opacity / 100)));
+
+    if (child.glowRadius && child.glowRadius > 0) {
+      ctx.shadowColor = child.glowColor || '#fbbf24';
+      ctx.shadowBlur = child.glowRadius;
+    }
+
+    // 3. Draw child image content
+    if (child.kind === 'image' && child.imageElement && child.imageElement.complete) {
+      const cw = child.width || child.imageElement.width;
+      const ch = child.height || child.imageElement.height;
+      ctx.drawImage(child.imageElement, -cw / 2, -ch / 2, cw, ch);
+    } else if (child.kind === 'shape') {
+      const r = child.outerRadius || 50;
+      ctx.fillStyle = child.fillColor || '#ffffff';
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }, [evaluateLayerAtFrame]);
 
   // Draw Layer into Canvas Context
   const drawLayer = useCallback((
@@ -782,41 +1263,53 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     // Render layers from bottom to top (like After Effects)
     const reversed = [...layers].reverse();
     reversed.forEach(layer => {
-      drawLayer(ctx, layer, frame, w, h);
+      // Child layers that are clipped/masked inside a parent are rendered with their parent
+      if (layer.clipToLayerId) {
+        const parentExists = layers.some(l => l.id === layer.clipToLayerId);
+        if (parentExists) return;
+        // If parent layer was deleted, render as standalone
+        drawLayer(ctx, layer, frame, w, h);
+        return;
+      }
+
+      // Check if this parent layer has any visible child layers
+      const childLayers = layers.filter(l => l.clipToLayerId === layer.id && l.visible);
+
+      if (childLayers.length === 0) {
+        drawLayer(ctx, layer, frame, w, h);
+      } else {
+        // Render on offscreen canvas for exact Alpha Matte clipping (source-atop)
+        if (!offscreenCanvasRef.current) {
+          offscreenCanvasRef.current = document.createElement('canvas');
+        }
+        const offCanvas = offscreenCanvasRef.current;
+        if (offCanvas.width !== w || offCanvas.height !== h) {
+          offCanvas.width = w;
+          offCanvas.height = h;
+        }
+        const offCtx = offCanvas.getContext('2d');
+        if (offCtx) {
+          offCtx.clearRect(0, 0, w, h);
+
+          // 1. Draw parent layer
+          drawLayer(offCtx, layer, frame, w, h);
+
+          // 2. Draw each child layer clipped inside parent layer with Alpha Matte
+          childLayers.forEach(child => {
+            offCtx.save();
+            offCtx.globalCompositeOperation = (child.blendMode as any) || 'source-atop';
+            drawChildLayerInsideParent(offCtx, child, layer, frame, w, h);
+            offCtx.restore();
+          });
+
+          // 3. Composite onto main canvas
+          ctx.drawImage(offCanvas, 0, 0);
+        }
+      }
     });
 
-    // Viewport-only Guides (Safe Zones / Avatar Outline)
+    // Viewport-only Guides & Handles
     if (!forExport) {
-      if (showSafeGuides) {
-        ctx.save();
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 4]);
-        // 90% Action Safe
-        ctx.strokeRect(w * 0.05, h * 0.05, w * 0.9, h * 0.9);
-        // 80% Title Safe
-        ctx.strokeRect(w * 0.1, h * 0.1, w * 0.8, h * 0.8);
-        // Center crosshair
-        ctx.beginPath();
-        ctx.moveTo(w / 2 - 15, h / 2);
-        ctx.lineTo(w / 2 + 15, h / 2);
-        ctx.moveTo(w / 2, h / 2 - 15);
-        ctx.lineTo(w / 2, h / 2 + 15);
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      if (showAvatarGuide) {
-        ctx.save();
-        ctx.strokeStyle = 'rgba(234, 179, 8, 0.5)';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([6, 4]);
-        ctx.beginPath();
-        ctx.arc(w / 2, h / 2, Math.min(w, h) * 0.22, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.restore();
-      }
-
       // Render Adobe After Effects Selection Bounding Box & Handles
       if (selectedLayerId) {
         const selLayer = layers.find(l => l.id === selectedLayerId);
@@ -825,7 +1318,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
         }
       }
     }
-  }, [compSettings, layers, showTransparencyGrid, showSafeGuides, showAvatarGuide, selectedLayerId, drawLayer, drawSelectionBox]);
+  }, [compSettings, layers, showTransparencyGrid, selectedLayerId, drawLayer, drawSelectionBox]);
 
   // Update canvas on frame change or selection change
   useEffect(() => {
@@ -848,12 +1341,17 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     const canvasX = (clientX / rect.width) * compSettings.width;
     const canvasY = (clientY / rect.height) * compSettings.height;
 
-    // 1. Check if the currently selected layer was clicked first
+    // 1. Check if the currently selected layer was clicked first, or if a child layer of it was clicked
     let hitLayer: AELayer | null = null;
     if (selectedLayerId) {
-      const currentSelected = layers.find(l => l.id === selectedLayerId);
-      if (currentSelected && hitTestLayer(currentSelected, canvasX, canvasY, currentFrame, compSettings.width, compSettings.height)) {
-        hitLayer = currentSelected;
+      const childOfSelected = layers.find(l => l.clipToLayerId === selectedLayerId && hitTestLayer(l, canvasX, canvasY, currentFrame, compSettings.width, compSettings.height));
+      if (childOfSelected) {
+        hitLayer = childOfSelected;
+      } else {
+        const currentSelected = layers.find(l => l.id === selectedLayerId);
+        if (currentSelected && hitTestLayer(currentSelected, canvasX, canvasY, currentFrame, compSettings.width, compSettings.height)) {
+          hitLayer = currentSelected;
+        }
       }
     }
 
@@ -904,14 +1402,29 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
       const deltaX = currentCanvasX - startCanvasX;
       const deltaY = currentCanvasY - startCanvasY;
 
-      const newPos = {
-        x: Math.round(startLayerPos.x + deltaX),
-        y: Math.round(startLayerPos.y + deltaY)
-      };
-
       setLayers(prev => prev.map(l => {
         if (l.id !== layerId) return l;
         if (l.locked) return l;
+
+        let localDeltaX = deltaX;
+        let localDeltaY = deltaY;
+        if (l.clipToLayerId) {
+          const parent = prev.find(p => p.id === l.clipToLayerId);
+          if (parent) {
+            const pTrans = evaluateLayerAtFrame(parent, currentFrame);
+            const pRad = (-pTrans.rotation * Math.PI) / 180;
+            const ps = pTrans.scale / 100;
+            if (ps > 0.001) {
+              localDeltaX = (deltaX * Math.cos(pRad) - deltaY * Math.sin(pRad)) / ps;
+              localDeltaY = (deltaX * Math.sin(pRad) + deltaY * Math.cos(pRad)) / ps;
+            }
+          }
+        }
+
+        const newPos = {
+          x: Math.round(startLayerPos.x + localDeltaX),
+          y: Math.round(startLayerPos.y + localDeltaY)
+        };
 
         if (l.animatingPosition) {
           const existingIdx = l.positionKeyframes.findIndex(k => k.frame === currentFrame);
@@ -1289,7 +1802,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
   };
 
   const deleteLayer = (id: string) => {
-    setLayers(prev => prev.filter(l => l.id !== id));
+    setLayers(prev => prev.filter(l => l.id !== id && l.clipToLayerId !== id));
     if (selectedLayerId === id) {
       setSelectedLayerId(null);
     }
@@ -1559,13 +2072,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
       const hasAnyAnim = l.animatingRotation || l.animatingPosition || l.animatingScale || l.animatingOpacity;
 
       if (!hasAnyAnim) {
-        // Default (e.g. wing animation): activate rotation with a single keyframe at current frame holding current value!
-        return {
-          ...l,
-          animatingRotation: true,
-          rotation: Math.round(evalResult.rotation),
-          rotationKeyframes: [{ frame: f, value: Math.round(evalResult.rotation) }]
-        };
+        return l;
       }
 
       let updated = { ...l };
@@ -1892,7 +2399,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
       const sprites: any[] = [];
 
       if (svgaExportMode === 'pieces') {
-        // --- PIECE-BASED SPRITES (قطع عادي ومصفوفات تحريك أصلية) ---
+        // --- PIECE-BASED SPRITES (قطع عادي ومصفوفات تحريك أصلية مع دعم الأقنعة matteKey) ---
         setExportStatusText('جاري تقطيع الطبقات إلى أصول شفافة (Sprites)...');
 
         // Order from bottom to top so top layer is drawn last in SVGA Player
@@ -1900,6 +2407,12 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
         if (activeLayers.length === 0) {
           throw new Error('لا توجد طبقات مرئية في المشروع لتصديرها.');
         }
+
+        // Identify parent layers that have clipped children
+        const parentIdsWithClippedChildren = new Set(
+          activeLayers.filter(l => l.clipToLayerId).map(l => l.clipToLayerId!)
+        );
+        const parentMatteKeys: Record<string, string> = {};
 
         for (let idx = 0; idx < activeLayers.length; idx++) {
           const layer = activeLayers[idx];
@@ -1918,50 +2431,120 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
           const imageKey = `piece_${idx}_${cleanName || 'layer'}`;
           images[imageKey] = bytes;
 
+          // Check if this layer is a clipped child layer (e.g. shine inside parent piece)
+          const isChild = !!layer.clipToLayerId;
+          const parentLayer = isChild ? layers.find(p => p.id === layer.clipToLayerId) : undefined;
+
           // Build sprite frame transformations across all frames
           const spriteFrames = [];
           for (let f = 0; f < total; f++) {
-            const { pos, scale, rotation, opacity } = evaluateLayerAtFrame(layer, f);
-            const alpha = !layer.visible ? 0.0 : Math.max(0, Math.min(1, opacity / 100));
+            if (isChild && parentLayer) {
+              // Compute child's world coordinates by composing parent transform and child local transform
+              const pTrans = evaluateLayerAtFrame(parentLayer, f);
+              const cTrans = evaluateLayerAtFrame(layer, f);
+              const pAlpha = !parentLayer.visible ? 0.0 : Math.max(0, Math.min(1, pTrans.opacity / 100));
+              const cAlpha = !layer.visible ? 0.0 : Math.max(0, Math.min(1, cTrans.opacity / 100));
+              const alpha = pAlpha * cAlpha;
 
-            const s = scale / 100;
-            const rad = (rotation * Math.PI) / 180;
-            const cos = Math.cos(rad);
-            const sin = Math.sin(rad);
+              const ps = pTrans.scale / 100;
+              const pRad = (pTrans.rotation * Math.PI) / 180;
+              const pa = ps * Math.cos(pRad);
+              const pb = ps * Math.sin(pRad);
+              const pc = -ps * Math.sin(pRad);
+              const pd = ps * Math.cos(pRad);
 
-            const a = s * cos;
-            const b = s * sin;
-            const c = -s * sin;
-            const d = s * cos;
+              const pcx = compSettings.width / 2 + pTrans.pos.x;
+              const pcy = compSettings.height / 2 + pTrans.pos.y;
 
-            const cx = compSettings.width / 2 + pos.x;
-            const cy = compSettings.height / 2 + pos.y;
+              const worldCx = pcx + (cTrans.pos.x * pa + cTrans.pos.y * pc);
+              const worldCy = pcy + (cTrans.pos.x * pb + cTrans.pos.y * pd);
 
-            const tx = cx - (piece.anchorX * a + piece.anchorY * c);
-            const ty = cy - (piece.anchorX * b + piece.anchorY * d);
+              const totalScale = (pTrans.scale / 100) * (cTrans.scale / 100);
+              const totalRad = ((pTrans.rotation + cTrans.rotation) * Math.PI) / 180;
+              const a = totalScale * Math.cos(totalRad);
+              const b = totalScale * Math.sin(totalRad);
+              const c = -totalScale * Math.sin(totalRad);
+              const d = totalScale * Math.cos(totalRad);
 
-            spriteFrames.push({
-              alpha: Number(alpha.toFixed(4)),
-              layout: {
-                x: 0,
-                y: 0,
-                width: piece.width,
-                height: piece.height
-              },
-              transform: {
-                a: Number(a.toFixed(5)),
-                b: Number(b.toFixed(5)),
-                c: Number(c.toFixed(5)),
-                d: Number(d.toFixed(5)),
-                tx: Number(tx.toFixed(3)),
-                ty: Number(ty.toFixed(3))
-              }
+              const tx = worldCx - (piece.anchorX * a + piece.anchorY * c);
+              const ty = worldCy - (piece.anchorX * b + piece.anchorY * d);
+
+              spriteFrames.push({
+                alpha: Number(alpha.toFixed(4)),
+                layout: {
+                  x: 0,
+                  y: 0,
+                  width: piece.width,
+                  height: piece.height
+                },
+                transform: {
+                  a: Number(a.toFixed(5)),
+                  b: Number(b.toFixed(5)),
+                  c: Number(c.toFixed(5)),
+                  d: Number(d.toFixed(5)),
+                  tx: Number(tx.toFixed(3)),
+                  ty: Number(ty.toFixed(3))
+                }
+              });
+            } else {
+              // Standard Layer
+              const { pos, scale, rotation, opacity } = evaluateLayerAtFrame(layer, f);
+              const alpha = !layer.visible ? 0.0 : Math.max(0, Math.min(1, opacity / 100));
+
+              const s = scale / 100;
+              const rad = (rotation * Math.PI) / 180;
+              const cos = Math.cos(rad);
+              const sin = Math.sin(rad);
+
+              const a = s * cos;
+              const b = s * sin;
+              const c = -s * sin;
+              const d = s * cos;
+
+              const cx = compSettings.width / 2 + pos.x;
+              const cy = compSettings.height / 2 + pos.y;
+
+              const tx = cx - (piece.anchorX * a + piece.anchorY * c);
+              const ty = cy - (piece.anchorX * b + piece.anchorY * d);
+
+              spriteFrames.push({
+                alpha: Number(alpha.toFixed(4)),
+                layout: {
+                  x: 0,
+                  y: 0,
+                  width: piece.width,
+                  height: piece.height
+                },
+                transform: {
+                  a: Number(a.toFixed(5)),
+                  b: Number(b.toFixed(5)),
+                  c: Number(c.toFixed(5)),
+                  d: Number(d.toFixed(5)),
+                  tx: Number(tx.toFixed(3)),
+                  ty: Number(ty.toFixed(3))
+                }
+              });
+            }
+          }
+
+          // If this layer is a parent with clipped children, generate a dedicated matte sprite with .matte in imageKey
+          if (parentIdsWithClippedChildren.has(layer.id)) {
+            const matteKey = `matte_${idx}_${cleanName || 'layer'}.matte`;
+            parentMatteKeys[layer.id] = matteKey;
+            images[matteKey] = bytes;
+            sprites.push({
+              imageKey: matteKey,
+              frames: spriteFrames
             });
           }
 
+          // Associate matteKey if this is a child layer
+          const assignedMatteKey = (isChild && parentLayer) ? parentMatteKeys[parentLayer.id] : undefined;
+
           sprites.push({
             imageKey: imageKey,
-            frames: spriteFrames
+            frames: spriteFrames,
+            ...(assignedMatteKey ? { matteKey: assignedMatteKey } : {})
           });
 
           setExportProgress(10 + Math.round(((idx + 1) / activeLayers.length) * 60));
@@ -2200,14 +2783,14 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
   // Render Composition Settings Window
   const renderCompSettingsContent = (isInitial: boolean) => (
-    <div className="w-full max-w-xl bg-slate-900/50 border border-slate-800/50 rounded-3xl p-6 sm:p-7 text-slate-200 flex flex-col gap-5 relative shadow-2xl">
+    <div className="w-full max-w-xl bg-slate-900/65 border border-slate-800/80 rounded-3xl p-6 sm:p-7 text-slate-200 flex flex-col gap-5 relative shadow-2xl">
       {/* Modal Header */}
       <div className="flex items-center justify-between border-b border-white/10 pb-3.5 relative z-10">
         <div className="flex items-center gap-2.5 font-bold text-base text-violet-300">
           <span className="bg-violet-500/20 text-violet-300 px-2 py-0.5 rounded-lg font-mono text-xs border border-violet-500/30">
             Ae
           </span>
-          <span>إعدادات الكومبوزيشن (Composition Settings)</span>
+          <span>Composition Settings</span>
         </div>
         {!isInitial && (
           <button
@@ -2220,38 +2803,13 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
         )}
       </div>
 
-      {/* Presets Quick Choices */}
-      <div className="flex flex-col gap-2 relative z-10">
-        <label className="text-xs text-slate-400 font-bold">قوالب أبعاد الإطارات الشائعة:</label>
-        <div className="grid grid-cols-3 gap-2 text-xs">
-          <button
-            type="button"
-            onClick={() => setResolutionPreset(750, 750, 90, 30)}
-            className="p-2.5 rounded-xl bg-white/5 hover:bg-violet-600/20 border border-white/10 hover:border-violet-500/40 text-center flex flex-col gap-1 transition-all"
-          >
-            <span className="font-bold text-white text-xs">إطار بروفايل قياسي</span>
-            <span className="text-[10px] text-slate-400 font-mono">750 × 750 px</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setResolutionPreset(512, 512, 90, 30)}
-            className="p-2.5 rounded-xl bg-white/5 hover:bg-violet-600/20 border border-white/10 hover:border-violet-500/40 text-center flex flex-col gap-1 transition-all"
-          >
-            <span className="font-bold text-white text-xs">مربع خفيف (512)</span>
-            <span className="text-[10px] text-slate-400 font-mono">512 × 512 px</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setResolutionPreset(1080, 1080, 120, 60)}
-            className="p-2.5 rounded-xl bg-white/5 hover:bg-violet-600/20 border border-white/10 hover:border-violet-500/40 text-center flex flex-col gap-1 transition-all"
-          >
-            <span className="font-bold text-white text-xs">فائق الدقة 60 FPS</span>
-            <span className="text-[10px] text-slate-400 font-mono">1080 × 1080 px</span>
-          </button>
+      {/* Validation Error Message */}
+      {compSettingsError && (
+        <div className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl bg-red-500/15 border border-red-500/40 text-red-300 text-xs font-semibold relative z-10 animate-shake">
+          <AlertCircle size={16} className="text-red-400 shrink-0" />
+          <span>{compSettingsError}</span>
         </div>
-      </div>
+      )}
 
       {/* Inputs Form */}
       <div className="flex flex-col gap-3 text-xs relative z-10">
@@ -2273,17 +2831,33 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
             <input
               type="number"
               value={modalWidth}
-              onChange={(e) => setModalWidth(Number(e.target.value))}
-              className="w-full bg-slate-800/40 border border-slate-700/50 px-3 py-2 rounded-xl text-slate-100 text-xs font-mono focus:outline-none focus:border-violet-500/60"
-              placeholder="Width"
+              onChange={(e) => {
+                const val = e.target.value;
+                setModalWidth(val === '' ? '' : Number(val));
+                if (compSettingsError) setCompSettingsError(null);
+              }}
+              className={`w-full bg-slate-800/40 border px-3 py-2 rounded-xl text-slate-100 text-xs font-mono focus:outline-none transition-all ${
+                compSettingsError && (modalWidth === '' || Number(modalWidth) <= 0)
+                  ? 'border-red-500/70 focus:border-red-500 ring-1 ring-red-500/30'
+                  : 'border-slate-700/50 focus:border-violet-500/60'
+              }`}
+              placeholder="العرض (px)"
             />
             <span className="text-slate-500">×</span>
             <input
               type="number"
               value={modalHeight}
-              onChange={(e) => setModalHeight(Number(e.target.value))}
-              className="w-full bg-slate-800/40 border border-slate-700/50 px-3 py-2 rounded-xl text-slate-100 text-xs font-mono focus:outline-none focus:border-violet-500/60"
-              placeholder="Height"
+              onChange={(e) => {
+                const val = e.target.value;
+                setModalHeight(val === '' ? '' : Number(val));
+                if (compSettingsError) setCompSettingsError(null);
+              }}
+              className={`w-full bg-slate-800/40 border px-3 py-2 rounded-xl text-slate-100 text-xs font-mono focus:outline-none transition-all ${
+                compSettingsError && (modalHeight === '' || Number(modalHeight) <= 0)
+                  ? 'border-red-500/70 focus:border-red-500 ring-1 ring-red-500/30'
+                  : 'border-slate-700/50 focus:border-violet-500/60'
+              }`}
+              placeholder="الارتفاع (px)"
             />
             <span className="text-slate-400 font-mono text-[11px]">px</span>
           </div>
@@ -2322,7 +2896,14 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
               min="1"
               max="1000"
               value={modalTotalFrames}
-              onChange={(e) => handleTotalFramesChange(Number(e.target.value))}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val === '') {
+                  setModalTotalFrames('');
+                } else {
+                  handleTotalFramesChange(Number(val));
+                }
+              }}
               className="w-24 bg-slate-800/50 border border-slate-700/50 px-3 py-1.5 rounded-xl text-slate-200 text-sm font-mono font-bold text-center focus:outline-none focus:border-violet-500/60"
             />
             <span className="text-slate-400 font-mono text-[11px]">فريم</span>
@@ -2355,7 +2936,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
         <button
           type="button"
           onClick={handleCreateComposition}
-          className="w-full sm:w-auto px-7 py-2.5 rounded-xl bg-violet-600/25 hover:bg-violet-600/35 border border-violet-500/40 hover:border-violet-400/60 text-violet-200 hover:text-white text-xs font-bold transition-all flex items-center justify-center gap-2 active:scale-[0.98] shadow-sm backdrop-blur-sm"
+          className="w-full sm:w-auto px-7 py-2.5 rounded-xl bg-violet-600/30 hover:bg-violet-600/45 border border-violet-500/50 hover:border-violet-400/70 text-violet-200 hover:text-white text-xs font-bold transition-all flex items-center justify-center gap-2 active:scale-[0.98] shadow-sm"
         >
           <Check size={16} />
           <span>تطبيق التعديلات</span>
@@ -2364,10 +2945,45 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
     </div>
   );
 
+  // Render an individual keyframe diamond in timeline tracks with double-click / drag repositioning
+  const renderKeyframeDiamond = (
+    layer: AELayer,
+    property: 'position' | 'scale' | 'rotation' | 'opacity',
+    kf: Keyframe<any>,
+    index: number,
+    colorBg: string,
+    label: string
+  ) => {
+    const isDragging = Boolean(
+      draggingKeyframe &&
+      draggingKeyframe.layerId === layer.id &&
+      draggingKeyframe.property === property &&
+      draggingKeyframe.originalFrame === kf.frame
+    );
+    const displayFrame = isDragging && draggingKeyframe ? draggingKeyframe.currentDragFrame : kf.frame;
+
+    return (
+      <div
+        key={`${property}-${index}-${kf.frame}`}
+        style={{ left: getTimelineLeftPercent(displayFrame) }}
+        title={isDragging ? `تحريك إلى فريم ${displayFrame}` : `انقر مرتين أو اسحب لتحريك المفتاح (فريم ${kf.frame} - ${label})`}
+        className={`absolute -translate-x-1/2 select-none ${
+          isDragging
+            ? 'z-30 cursor-grabbing'
+            : 'z-10 cursor-grab'
+        }`}
+        onMouseDown={(e) => handleKeyframeMouseDown(layer.id, property, kf.frame, e)}
+        onDoubleClick={(e) => handleKeyframeDoubleClick(layer.id, property, kf.frame, e)}
+      >
+        <div className={`w-2.5 h-2.5 rotate-45 border border-slate-900 shadow-md ${colorBg}`} />
+      </div>
+    );
+  };
+
   // When no project is loaded yet, show ONLY the popup window itself without black backdrop!
   if (!hasProject) {
     return (
-      <div className="w-full flex items-center justify-center min-h-[640px] py-8 px-4 select-none">
+      <div className="w-full flex items-start justify-center pt-6 sm:pt-10 pb-16 px-4 select-none">
         <motion.div
           initial={{ opacity: 0, scale: 0.95, y: 10 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
@@ -2396,24 +3012,6 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
             <span className="bg-violet-600/30 text-violet-300 px-1.5 py-0.5 rounded font-mono text-[11px] border border-violet-500/40">Ae</span>
             <span className="font-semibold tracking-wide text-slate-200">AFTER EFFECTS STUDIO</span>
           </div>
-
-          <div className="h-4 w-px bg-slate-800 hidden sm:block"></div>
-
-          {/* Menus */}
-          <div className="hidden md:flex items-center gap-1 text-slate-400">
-            <button 
-              onClick={() => setShowCompSettingsModal(true)}
-              className="px-2 py-1 rounded hover:bg-white/5 hover:text-white transition-colors"
-            >
-              مشروع جديد (New Comp)
-            </button>
-            <button 
-              onClick={() => setShowCompSettingsModal(true)}
-              className="px-2 py-1 rounded hover:bg-white/5 hover:text-white transition-colors"
-            >
-              إعدادات الكومبوزيشن (Ctrl+K)
-            </button>
-          </div>
         </div>
 
         {/* Right Side: Export Action */}
@@ -2438,12 +3036,12 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
           <div className="p-2.5 border-b border-slate-800/60 flex items-center justify-between text-slate-400 font-bold">
             <div className="flex items-center gap-1.5">
               <Film size={13} className="text-violet-400" />
-              <span>مشروع (Project)</span>
+              <span>Project</span>
             </div>
             <button 
               onClick={() => setShowCompSettingsModal(true)}
               className="p-1 hover:text-white rounded"
-              title="إعدادات الكومبوزيشن"
+              title="Settings"
             >
               <Settings size={13} />
             </button>
@@ -2607,7 +3205,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                           className="p-0.5 text-slate-500 hover:text-slate-200 shrink-0"
                           title={layer.visible ? 'إخفاء الطبقة' : 'إظهار الطبقة'}
                         >
-                          {layer.visible ? <Eye size={12} /> : <EyeOff size={12} className="text-red-400" />}
+                          {layer.visible ? <Eye size={12} /> : <EyeOff size={12} className="text-slate-400" />}
                         </button>
 
                         <span className="truncate font-medium text-[11px] select-none">{layer.name}</span>
@@ -2673,8 +3271,8 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
               <span className="font-mono text-[11px] text-slate-300 font-bold bg-slate-800/50 px-2 py-0.5 rounded">
                 {compSettings.name}
               </span>
-              <span className="text-slate-500 text-[11px]">
-                {Math.round(zoomLevel * 100)}%
+              <span className="text-[11px] text-slate-400 font-mono">
+                {compSettings.width} × {compSettings.height} px
               </span>
             </div>
 
@@ -2703,54 +3301,82 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                 <Grid size={13} />
               </button>
 
-              <button
-                onClick={() => setShowSafeGuides(!showSafeGuides)}
-                title="عرض خطوط الحماية الإرشادية (Safe Zones)"
-                className={`p-1.5 rounded transition-all ${showSafeGuides ? 'bg-cyan-600/20 text-cyan-300 border border-cyan-500/30' : 'text-slate-500 hover:text-white'}`}
-              >
-                <Crosshair size={13} />
-              </button>
-
-              <button
-                onClick={() => setShowAvatarGuide(!showAvatarGuide)}
-                title="عرض خط مساحة صورة الحساب (Avatar Guide)"
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] transition-all ${showAvatarGuide ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'text-slate-500 hover:text-white'}`}
-              >
-                <Shield size={12} />
-                <span>دليل الأفاتار</span>
-              </button>
-
               <div className="w-px h-3.5 bg-slate-800"></div>
 
-              <button
-                onClick={fitToView}
-                title="ملاءمة لحجم الشاشة تلقائياً (Fit up to view)"
-                className="px-2 py-0.5 rounded text-[11px] font-semibold bg-violet-600/20 text-violet-300 border border-violet-500/30 hover:bg-violet-600/30 transition-all flex items-center gap-1"
-              >
-                <span>ملاءمة</span>
-                <span className="text-[10px] text-violet-400 font-mono">Fit</span>
-              </button>
+              {/* After Effects Style Zoom Controls */}
+              <div className="flex items-center gap-1 bg-slate-800/60 p-0.5 rounded-lg border border-slate-700/60">
+                <button
+                  onClick={fitToView}
+                  title="ملاءمة الشاشة بالكامل (Fit) - يملأ مساحة العمل بوضوح مثل After Effects"
+                  className="px-2 py-0.5 rounded text-[11px] font-semibold bg-violet-600/20 text-violet-300 hover:bg-violet-600/40 border border-violet-500/30 transition-all flex items-center gap-1"
+                >
+                  <Maximize2 size={11} />
+                  <span>Fit</span>
+                </button>
 
-              <button
-                onClick={() => setZoomLevel(prev => Math.max(0.25, Number((prev - 0.15).toFixed(2))))}
-                className="p-1 hover:text-white text-slate-400"
-                title="تصغير"
-              >
-                <ZoomOut size={13} />
-              </button>
-              <button
-                onClick={() => setZoomLevel(1)}
-                className="px-1.5 py-0.5 rounded text-[10px] text-slate-400 hover:text-white hover:bg-white/5"
-              >
-                100%
-              </button>
-              <button
-                onClick={() => setZoomLevel(prev => Math.min(2.5, Number((prev + 0.15).toFixed(2))))}
-                className="p-1 hover:text-white text-slate-400"
-                title="تكبير"
-              >
-                <ZoomIn size={13} />
-              </button>
+                {(() => {
+                  const roundedZoom = Math.round(zoomLevel * 100);
+                  const standardZooms = [25, 50, 75, 100];
+                  const isStandard = standardZooms.includes(roundedZoom);
+                  return (
+                    <select
+                      value={isStandard ? roundedZoom : 'custom'}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === 'fit') {
+                          fitToView();
+                        } else {
+                          setZoomLevel(Math.min(1.0, Number(val) / 100));
+                        }
+                      }}
+                      title="قائمة نسب التكبير (Zoom %)"
+                      className="bg-slate-900/80 border border-slate-700/80 rounded px-1.5 py-0.5 text-[11px] text-slate-200 font-mono focus:outline-none focus:border-violet-500 cursor-pointer"
+                    >
+                      <option value="fit">Fit (ملاءمة)</option>
+                      {!isStandard && (
+                        <option value="custom">{roundedZoom}%</option>
+                      )}
+                      <option value="25">25%</option>
+                      <option value="50">50%</option>
+                      <option value="75">75%</option>
+                      <option value="100">100% (أصلي 1:1)</option>
+                    </select>
+                  );
+                })()}
+
+                <button
+                  onClick={() => setZoomLevel(prev => Math.max(0.15, Number((prev * 0.8).toFixed(2))))}
+                  className="p-1 hover:text-white text-slate-400 hover:bg-slate-700/50 rounded transition-colors"
+                  title="تصغير (Zoom Out)"
+                >
+                  <ZoomOut size={13} />
+                </button>
+
+                <button
+                  onClick={() => setZoomLevel(1)}
+                  title="الحجم الأصلي الفعلي 100% (1:1)"
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors ${
+                    Math.round(zoomLevel * 100) === 100
+                      ? 'bg-violet-600/30 text-violet-200 font-bold border border-violet-500/40'
+                      : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                  }`}
+                >
+                  100%
+                </button>
+
+                <button
+                  onClick={() => setZoomLevel(prev => Math.min(1.0, Number((prev * 1.25).toFixed(2))))}
+                  disabled={zoomLevel >= 1}
+                  className={`p-1 rounded transition-colors ${
+                    zoomLevel >= 1
+                      ? 'text-slate-600 cursor-not-allowed opacity-40'
+                      : 'hover:text-white text-slate-400 hover:bg-slate-700/50'
+                  }`}
+                  title="تكبير (Zoom In - بحد أقصى 100%)"
+                >
+                  <ZoomIn size={13} />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -2810,6 +3436,109 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                   />
                 </div>
 
+                {/* Masked Child Piece (Alpha Matte) Controls */}
+                {selectedLayer.clipToLayerId ? (
+                  /* Masked Child Layer Indicator Banner */
+                  <div className="p-3 rounded-xl bg-violet-950/20 border border-violet-500/30 flex flex-col gap-2.5 shadow-sm backdrop-blur-xs">
+                    <div className="flex items-center justify-between gap-1.5">
+                      <div className="flex items-center gap-1.5 text-xs font-bold text-violet-300 min-w-0">
+                        <span className="p-1 rounded-lg bg-violet-500/15 text-violet-300 border border-violet-500/25 flex items-center justify-center shrink-0">
+                          <Layers size={13} />
+                        </span>
+                        <span className="whitespace-nowrap text-[11px]">قطعة مدمجة كقناع (Alpha Matte)</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => updateSelectedLayer({ clipToLayerId: undefined, blendMode: 'source-over' })}
+                        className="p-1 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-500/15 border border-slate-700/50 hover:border-red-500/40 transition-all flex items-center justify-center cursor-pointer shadow-xs shrink-0 group"
+                        title="إزالة الدمج (فك ارتباط الطبقة وجعلها حرة)"
+                      >
+                        <X size={14} className="group-hover:scale-110 transition-transform" />
+                      </button>
+                    </div>
+
+                    <div className="text-[11px] text-slate-300 bg-slate-900/60 p-2.5 rounded-lg border border-slate-800/80 flex items-center justify-between">
+                      <span className="text-slate-400">مدمجة داخل:</span>
+                      <strong className="text-violet-200 font-bold">{layers.find(l => l.id === selectedLayer.clipToLayerId)?.name || 'القطعة الأصلية'}</strong>
+                    </div>
+                  </div>
+                ) : (
+                  /* Parent Layer: Add Masked Piece via Direct Device Upload */
+                  <div className="flex flex-col gap-2.5 p-3 bg-violet-950/20 rounded-xl border border-violet-500/25 shadow-sm backdrop-blur-xs">
+                    <input
+                      ref={additionalLayerFileInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={handleUploadMaskedChildLayer}
+                      className="hidden"
+                    />
+
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5 text-xs font-bold text-violet-300 min-w-0">
+                        <span className="p-1 rounded-lg bg-violet-500/15 text-violet-300 border border-violet-500/25 flex items-center justify-center shrink-0">
+                          <Layers size={13} />
+                        </span>
+                        <span className="whitespace-nowrap text-[11px]">طبقة إضافية مدمجة (Alpha Matte)</span>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => additionalLayerFileInputRef.current?.click()}
+                      className="w-full py-1.5 px-3 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 active:bg-violet-500/35 border border-violet-500/35 hover:border-violet-400/60 text-violet-200 hover:text-white text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-all shadow-xs active:scale-[0.98] group cursor-pointer"
+                    >
+                      <Upload size={12} className="text-violet-300 group-hover:scale-110 transition-transform" />
+                      <span>إضافة قطعة مدمجة</span>
+                    </button>
+
+                    {/* Attached Masked Pieces List */}
+                    {layers.filter(l => l.clipToLayerId === selectedLayer.id).length > 0 && (
+                      <div className="flex flex-col gap-1.5 mt-0.5">
+                        <span className="text-[10px] text-slate-400 font-bold px-0.5">القطع المدمجة داخل هذه الطبقة:</span>
+                        {layers.filter(l => l.clipToLayerId === selectedLayer.id).map(child => (
+                          <div
+                            key={child.id}
+                            className="flex items-center justify-between p-2 rounded-lg bg-slate-900/70 hover:bg-slate-900 border border-slate-700/60 hover:border-violet-500/50 transition-all group shadow-sm"
+                          >
+                            <div
+                              onClick={() => setSelectedLayerId(child.id)}
+                              className="flex items-center gap-2 min-w-0 flex-1 cursor-pointer"
+                            >
+                              <div className="w-6 h-6 rounded-md bg-slate-950 border border-slate-700 overflow-hidden flex items-center justify-center shrink-0">
+                                {child.imageSrc && <img src={child.imageSrc} alt="" className="w-full h-full object-contain" />}
+                              </div>
+                              <span className="text-xs font-bold text-slate-200 truncate group-hover:text-violet-300 transition-colors">
+                                {child.name}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => setSelectedLayerId(child.id)}
+                                className="text-[10px] text-violet-400 hover:text-violet-300 font-bold px-1.5 py-0.5 rounded hover:bg-violet-500/10 transition-colors cursor-pointer"
+                                title="تحديد الطبقة وتحريكها"
+                              >
+                                تحريك ➔
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLayers(prev => prev.map(l => l.id === child.id ? { ...l, clipToLayerId: undefined, blendMode: 'source-over' } : l));
+                                }}
+                                className="p-1 rounded-md text-slate-500 hover:text-red-400 hover:bg-red-500/15 border border-transparent hover:border-red-500/30 transition-all cursor-pointer"
+                                title="إزالة الدمج (فك ارتباط هذه القطعة)"
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Layer Stacking Order */}
                 <div className="flex flex-col gap-2 pt-2 border-t border-slate-800/60">
                   <div className="flex items-center justify-between text-slate-300 font-bold">
@@ -2858,33 +3587,10 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                   </div>
                 </div>
 
-                {/* Transform Section with After Effects Style Stopwatches & Keyframe Diamonds */}
+                {/* Transform Section */}
                 <div className="flex flex-col gap-2.5 pt-2 border-t border-slate-800/60">
                   <div className="flex items-center justify-between text-slate-300 font-bold">
                     <span>التحويل (Transform)</span>
-                    <div className="flex items-center gap-1 bg-slate-950/60 px-1.5 py-0.5 rounded border border-slate-800 text-[10px] text-slate-400 font-mono">
-                      <button
-                        onClick={goToPrevKeyframe}
-                        title="الانتقال للمفتاح السابق (J)"
-                        className="px-1 hover:text-cyan-300 transition-colors"
-                      >
-                        ◀
-                      </button>
-                      <button
-                        onClick={() => addOrToggleKeyframeForLayer(selectedLayer.id)}
-                        title="إضافة أو إزالة نقطة كي فريم (Diamond ◇) عند موضع الخط الحالي"
-                        className="px-1 hover:text-amber-400 transition-colors"
-                      >
-                        {hasKeyframeAtCurrentFrame('rotation') || hasKeyframeAtCurrentFrame('position') || hasKeyframeAtCurrentFrame('scale') || hasKeyframeAtCurrentFrame('opacity') ? '◆' : '◇'}
-                      </button>
-                      <button
-                        onClick={goToNextKeyframe}
-                        title="الانتقال للمفتاح التالي (K)"
-                        className="px-1 hover:text-cyan-300 transition-colors"
-                      >
-                        ▶
-                      </button>
-                    </div>
                   </div>
 
                   {/* Position */}
@@ -2911,23 +3617,25 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <span>الموضع (X, Y)</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <input
-                        type="number"
+                      <NumericInput
                         value={Math.round(evaluateLayerAtFrame(selectedLayer, currentFrame).pos.x)}
-                        onChange={(e) => {
+                        onChange={(val) => {
                           const curY = evaluateLayerAtFrame(selectedLayer, currentFrame).pos.y;
-                          updateLayerPropertyValue('position', { x: Number(e.target.value), y: curY });
+                          updateLayerPropertyValue('position', { x: val, y: curY });
                         }}
-                        className="w-14 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
+                        defaultValue={0}
+                        placeholder="X"
+                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
-                      <input
-                        type="number"
+                      <NumericInput
                         value={Math.round(evaluateLayerAtFrame(selectedLayer, currentFrame).pos.y)}
-                        onChange={(e) => {
+                        onChange={(val) => {
                           const curX = evaluateLayerAtFrame(selectedLayer, currentFrame).pos.x;
-                          updateLayerPropertyValue('position', { x: curX, y: Number(e.target.value) });
+                          updateLayerPropertyValue('position', { x: curX, y: val });
                         }}
-                        className="w-14 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
+                        defaultValue={0}
+                        placeholder="Y"
+                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                     </div>
                   </div>
@@ -2956,12 +3664,12 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <span>الحجم (Scale %)</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <input
-                        type="number"
-                        min="1"
-                        max="500"
+                      <NumericInput
+                        min={1}
+                        max={500}
+                        defaultValue={100}
                         value={Math.round(evaluateLayerAtFrame(selectedLayer, currentFrame).scale)}
-                        onChange={(e) => updateLayerPropertyValue('scale', Number(e.target.value))}
+                        onChange={(val) => updateLayerPropertyValue('scale', val)}
                         className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                     </div>
@@ -2991,10 +3699,10 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <span>الدوران (Rotation)</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <input
-                        type="number"
+                      <NumericInput
                         value={Math.round(evaluateLayerAtFrame(selectedLayer, currentFrame).rotation)}
-                        onChange={(e) => updateLayerPropertyValue('rotation', Number(e.target.value))}
+                        onChange={(val) => updateLayerPropertyValue('rotation', val)}
+                        defaultValue={0}
                         className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                       <span className="text-slate-500 text-[10px]">°</span>
@@ -3025,12 +3733,12 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <span>الشفافية (Opacity)</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <input
-                        type="number"
-                        min="0"
-                        max="100"
+                      <NumericInput
+                        min={0}
+                        max={100}
+                        defaultValue={100}
                         value={Math.round(evaluateLayerAtFrame(selectedLayer, currentFrame).opacity)}
-                        onChange={(e) => updateLayerPropertyValue('opacity', Number(e.target.value))}
+                        onChange={(val) => updateLayerPropertyValue('opacity', val)}
                         className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                       <span className="text-slate-500 text-[10px]">%</span>
@@ -3047,20 +3755,22 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <>
                         <div className="flex items-center justify-between">
                           <span className="text-slate-400">نصف القطر الخارجي</span>
-                          <input
-                            type="number"
+                          <NumericInput
                             value={selectedLayer.outerRadius || 180}
-                            onChange={(e) => updateSelectedLayer({ outerRadius: Number(e.target.value) })}
-                            className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono"
+                            defaultValue={180}
+                            min={10}
+                            onChange={(val) => updateSelectedLayer({ outerRadius: val })}
+                            className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                           />
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="text-slate-400">نصف القطر الداخلي</span>
-                          <input
-                            type="number"
+                          <NumericInput
                             value={selectedLayer.innerRadius || 150}
-                            onChange={(e) => updateSelectedLayer({ innerRadius: Number(e.target.value) })}
-                            className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono"
+                            defaultValue={150}
+                            min={5}
+                            onChange={(val) => updateSelectedLayer({ innerRadius: val })}
+                            className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                           />
                         </div>
                       </>
@@ -3068,11 +3778,13 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
                     <div className="flex items-center justify-between">
                       <span className="text-slate-400">سماكة الخط (Stroke)</span>
-                      <input
-                        type="number"
+                      <NumericInput
                         value={selectedLayer.strokeWidth || 8}
-                        onChange={(e) => updateSelectedLayer({ strokeWidth: Number(e.target.value) })}
-                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono"
+                        defaultValue={8}
+                        min={1}
+                        max={100}
+                        onChange={(val) => updateSelectedLayer({ strokeWidth: val })}
+                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                     </div>
 
@@ -3088,13 +3800,13 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
                     <div className="flex items-center justify-between">
                       <span className="text-slate-400">توهج النيون (Glow)</span>
-                      <input
-                        type="number"
-                        min="0"
-                        max="80"
+                      <NumericInput
+                        min={0}
+                        max={80}
+                        defaultValue={0}
                         value={selectedLayer.glowRadius || 0}
-                        onChange={(e) => updateSelectedLayer({ glowRadius: Number(e.target.value) })}
-                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono"
+                        onChange={(val) => updateSelectedLayer({ glowRadius: val })}
+                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                     </div>
 
@@ -3125,11 +3837,13 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
                     <div className="flex items-center justify-between">
                       <span className="text-slate-400">حجم الخط</span>
-                      <input
-                        type="number"
+                      <NumericInput
                         value={selectedLayer.fontSize || 32}
-                        onChange={(e) => updateSelectedLayer({ fontSize: Number(e.target.value) })}
-                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono"
+                        defaultValue={32}
+                        min={8}
+                        max={200}
+                        onChange={(val) => updateSelectedLayer({ fontSize: val })}
+                        className="w-16 bg-slate-800/40 border border-slate-700/50 px-1.5 py-1 rounded text-right text-[11px] font-mono focus:border-cyan-500 focus:outline-none"
                       />
                     </div>
 
@@ -3161,12 +3875,12 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
         <div className="h-9 border-b border-slate-800/60 bg-slate-800/25 px-4 flex items-center justify-between">
           {/* Timecode & Frame counter */}
           <div className="flex items-center gap-3 font-mono text-[11px]">
-            <div className="flex items-center gap-1 bg-slate-800/60 px-2 py-0.5 rounded border border-slate-700/50 text-cyan-300 font-bold">
+            <div className="flex items-center gap-1 bg-slate-800/60 px-2 py-0.5 rounded border border-slate-700/50 text-slate-400 font-bold">
               <span>{String(Math.floor(currentFrame / compSettings.fps)).padStart(2, '0')}:</span>
               <span>{String(currentFrame % compSettings.fps).padStart(2, '0')}</span>
             </div>
             <span className="text-slate-400">
-              فريم: <strong className="text-emerald-400">{currentFrame}</strong> / {compSettings.totalFrames}
+              فريم: <strong className="text-slate-400 font-bold">{currentFrame}</strong> / {compSettings.totalFrames}
             </span>
           </div>
 
@@ -3217,59 +3931,6 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                 ▶▶
               </button>
             </div>
-
-            {/* Prominent After Effects Keyframe Diamond Button at current playhead */}
-            <button
-              onClick={() => {
-                if (selectedLayerId) {
-                  addOrToggleKeyframeForLayer(selectedLayerId);
-                }
-              }}
-              disabled={!selectedLayerId}
-              title={
-                !selectedLayerId 
-                  ? "حدد طبقة لإضافة نقطة كي فريم" 
-                  : (selectedLayer && (
-                      hasKeyframeAtCurrentFrame('rotation', selectedLayer) ||
-                      hasKeyframeAtCurrentFrame('position', selectedLayer) ||
-                      hasKeyframeAtCurrentFrame('scale', selectedLayer) ||
-                      hasKeyframeAtCurrentFrame('opacity', selectedLayer)
-                    ))
-                    ? "إزالة نقطة الكي فريم في هذا الفريم"
-                    : "إضافة نقطة كي فريم (Diamond ◇) عند موضع الخط الحالي بالضبط"
-              }
-              className={`px-3 py-1 rounded-lg border flex items-center gap-1.5 font-bold text-[11px] transition-all ${
-                selectedLayer && (
-                  hasKeyframeAtCurrentFrame('rotation', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('position', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('scale', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('opacity', selectedLayer)
-                )
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/60 shadow-sm'
-                  : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-200 border-slate-700 hover:text-white'
-              } disabled:opacity-30 disabled:pointer-events-none active:scale-95`}
-            >
-              <div className={`w-2.5 h-2.5 rotate-45 border transition-all ${
-                selectedLayer && (
-                  hasKeyframeAtCurrentFrame('rotation', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('position', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('scale', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('opacity', selectedLayer)
-                )
-                  ? 'bg-amber-400 border-amber-200 scale-110 shadow-sm'
-                  : 'border-cyan-400 bg-transparent'
-              }`} />
-              <span>
-                {selectedLayer && (
-                  hasKeyframeAtCurrentFrame('rotation', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('position', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('scale', selectedLayer) ||
-                  hasKeyframeAtCurrentFrame('opacity', selectedLayer)
-                )
-                  ? 'حذف نقطة كي فريم'
-                  : 'إضافة نقطة كي فريم (◇)'}
-              </span>
-            </button>
           </div>
 
           <div className="flex items-center gap-2 text-slate-400 text-[11px]">
@@ -3280,14 +3941,17 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
         {/* Timeline Tracks & Keyframe Ruler */}
         <div className="flex-1 flex overflow-hidden">
           {/* Left Column: Layer Names & Keyframe Toggles */}
-          <div className="w-64 border-r border-slate-800/60 bg-slate-900/20 overflow-y-auto flex flex-col">
+          <div 
+            ref={layerListScrollRef}
+            onScroll={handleLayerListScroll}
+            className="w-64 border-r border-slate-800/60 bg-slate-900/20 overflow-y-auto flex flex-col [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden shrink-0"
+          >
             {/* Column Header */}
-            <div className="h-6 px-3 border-b border-slate-800/60 bg-slate-800/40 flex items-center justify-between text-[10px] text-slate-400 font-bold uppercase tracking-wider shrink-0">
+            <div className="h-6 px-3 border-b border-slate-800/60 bg-slate-800/40 flex items-center text-[10px] text-slate-400 font-bold uppercase tracking-wider shrink-0">
               <span className="flex items-center gap-1">
                 <Layers size={11} className="text-violet-400" />
                 <span>اسم الطبقة (Layer Name)</span>
               </span>
-              <span>التحريك</span>
             </div>
             {layers.length === 0 ? (
               <div className="p-4 text-center text-slate-500 text-[11px]">
@@ -3351,7 +4015,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                     }}
                     onClick={() => setSelectedLayerId(layer.id)}
                     data-interactive="true"
-                    className={`layer-row-item relative h-8 px-2 border-b border-slate-800/40 flex items-center justify-between cursor-pointer text-[11px] transition-colors shrink-0 ${
+                    className={`layer-row-item relative h-8 px-2 border-b border-slate-800/40 flex items-center cursor-pointer text-[11px] transition-colors shrink-0 ${
                       isDragging
                         ? 'opacity-30 border-dashed border-cyan-400 bg-slate-800/40'
                         : selectedLayerId === layer.id
@@ -3367,7 +4031,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <div className="absolute -bottom-0.5 left-0 right-0 h-0.5 bg-cyan-400 z-30 pointer-events-none"></div>
                     )}
 
-                    <div className="flex items-center gap-1.5 truncate">
+                    <div className="flex items-center gap-1.5 truncate flex-1">
                       <div 
                         className="cursor-grab active:cursor-grabbing text-slate-600 hover:text-slate-300 p-0.5 shrink-0"
                         title="اسحب لتغيير ترتيب الطبقة"
@@ -3384,47 +4048,12 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                           <Layers size={9} className="text-slate-400" />
                         )}
                       </div>
+                      {layer.clipToLayerId && (
+                        <span className="text-[9px] px-1 py-0.5 rounded bg-violet-600/30 text-violet-300 border border-violet-500/40 shrink-0 font-bold" title="طبقة مدمجة كقناع داخل القطعة">
+                          قناع ↳
+                        </span>
+                      )}
                       <span className="truncate">{layer.name}</span>
-                    </div>
-
-                    <div className="flex items-center gap-1 shrink-0">
-                      {/* Add/Toggle Keyframe Diamond Button on this layer */}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelectedLayerId(layer.id);
-                          addOrToggleKeyframeForLayer(layer.id);
-                        }}
-                        title={`إضافة/إزالة مفتاح كي فريم (◇) للطبقة عند فريم ${currentFrame}`}
-                        className={`p-1 rounded transition-all hover:bg-slate-700/60 ${
-                          hasKeyframeAtCurrentFrame('rotation', layer) ||
-                          hasKeyframeAtCurrentFrame('position', layer) ||
-                          hasKeyframeAtCurrentFrame('scale', layer) ||
-                          hasKeyframeAtCurrentFrame('opacity', layer)
-                            ? 'text-amber-400'
-                            : 'text-slate-500 hover:text-cyan-400'
-                        }`}
-                      >
-                        <div className={`w-2.5 h-2.5 rotate-45 border transition-all ${
-                          hasKeyframeAtCurrentFrame('rotation', layer) ||
-                          hasKeyframeAtCurrentFrame('position', layer) ||
-                          hasKeyframeAtCurrentFrame('scale', layer) ||
-                          hasKeyframeAtCurrentFrame('opacity', layer)
-                            ? 'bg-amber-400 border-amber-200 scale-110 shadow-sm'
-                            : 'border-current bg-transparent'
-                        }`} />
-                      </button>
-
-                      {layer.animatingScale && (
-                        <span className="text-[9px] px-1 bg-cyan-500/20 text-cyan-300 rounded font-mono border border-cyan-500/30">Scl</span>
-                      )}
-                      {layer.animatingPosition && (
-                        <span className="text-[9px] px-1 bg-emerald-500/20 text-emerald-300 rounded font-mono border border-emerald-500/30">Pos</span>
-                      )}
-                      {layer.animatingOpacity && (
-                        <span className="text-[9px] px-1 bg-purple-500/20 text-purple-300 rounded font-mono border border-purple-500/30">Op</span>
-                      )}
                     </div>
                   </div>
                 );
@@ -3433,7 +4062,7 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
           </div>
 
           {/* Right Column: Time Ruler & Keyframe Track Canvas */}
-          <div className="flex-1 flex flex-col overflow-x-auto relative bg-slate-900/20">
+          <div className="flex-1 flex flex-col overflow-x-hidden relative bg-slate-900/20">
             {/* Frame Tick Ruler */}
             <div 
               ref={rulerRef}
@@ -3448,12 +4077,11 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
               {Array.from({ length: Math.ceil(compSettings.totalFrames / 5) + 1 }).map((_, i) => {
                 const f = i * 5;
                 if (f > compSettings.totalFrames) return null;
-                const leftPct = (f / compSettings.totalFrames) * 100;
                 const isMajor = f % 15 === 0;
                 return (
                   <div
                     key={f}
-                    style={{ left: `${leftPct}%` }}
+                    style={{ left: getTimelineLeftPercent(f) }}
                     className="absolute top-0 bottom-0 flex flex-col justify-between pointer-events-none"
                   >
                     <span className="text-[9px] text-slate-500 font-mono -translate-x-1/2">
@@ -3466,23 +4094,33 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
               {/* Blue Playhead / CTI Marker */}
               <div
-                style={{ left: `${(currentFrame / compSettings.totalFrames) * 100}%` }}
+                style={{ left: getTimelineLeftPercent(currentFrame) }}
                 className="absolute top-0 bottom-0 w-2.5 -translate-x-1/2 z-20 pointer-events-none flex flex-col items-center"
               >
-                <div className="w-2.5 h-2.5 bg-cyan-400 rotate-45 -mt-1"></div>
+                <div className="w-2.5 h-2.5 bg-cyan-400 rotate-45 -mt-1 shadow-sm"></div>
               </div>
             </div>
 
-            {/* Layer Tracks & Diamond Keyframes */}
-            <div className="flex-1 overflow-y-auto relative">
+            {/* Layer Tracks & Diamond Keyframes - Single Main Scrollbar */}
+            <div 
+              ref={tracksScrollRef}
+              onScroll={handleTracksScroll}
+              className="flex-1 overflow-y-auto overflow-x-hidden relative"
+            >
               {/* Playhead vertical guide line extending through tracks */}
               <div
-                style={{ left: `${(currentFrame / compSettings.totalFrames) * 100}%` }}
+                style={{ left: getTimelineLeftPercent(currentFrame) }}
                 className="absolute top-0 bottom-0 w-px bg-cyan-400/70 z-10 pointer-events-none"
               ></div>
 
               {layers.map(layer => {
                 const isSelected = selectedLayerId === layer.id;
+                const hasAnyStopwatchActive = Boolean(
+                  layer.animatingRotation ||
+                  layer.animatingPosition ||
+                  layer.animatingScale ||
+                  layer.animatingOpacity
+                );
                 const hasKfHere = (
                   hasKeyframeAtCurrentFrame('rotation', layer) ||
                   hasKeyframeAtCurrentFrame('position', layer) ||
@@ -3495,21 +4133,23 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                     key={layer.id}
                     onClick={(e) => {
                       const rect = e.currentTarget.getBoundingClientRect();
-                      const clickX = e.clientX - rect.left;
-                      const pct = Math.max(0, Math.min(1, clickX / rect.width));
-                      const targetF = Math.round(pct * (compSettings.totalFrames - 1));
-                      setCurrentFrame(targetF);
+                      const padding = 8;
+                      const usableWidth = Math.max(1, rect.width - padding * 2);
+                      const clickX = e.clientX - rect.left - padding;
+                      const pct = Math.max(0, Math.min(1, clickX / usableWidth));
+                      const targetF = Math.round(pct * compSettings.totalFrames);
+                      setCurrentFrame(Math.max(0, Math.min(compSettings.totalFrames, targetF)));
                       setSelectedLayerId(layer.id);
                     }}
                     className={`h-8 border-b border-slate-800/40 relative flex items-center transition-colors cursor-pointer ${
                       isSelected ? 'bg-violet-950/20' : 'hover:bg-slate-800/20'
                     }`}
                   >
-                    {/* Interactive After Effects Keyframe Diamond at playhead position */}
-                    {isSelected && (
+                    {/* Interactive After Effects Keyframe Diamond at playhead position - only when stopwatch is active */}
+                    {isSelected && hasAnyStopwatchActive && (
                       <div
-                        style={{ left: `${(currentFrame / compSettings.totalFrames) * 100}%` }}
-                        className="absolute -translate-x-1/2 z-20 flex items-center justify-center pointer-events-auto"
+                        style={{ left: getTimelineLeftPercent(currentFrame) }}
+                        className={`absolute -translate-x-1/2 z-20 flex items-center justify-center ${hasKfHere ? 'pointer-events-none' : 'pointer-events-auto'}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           setSelectedLayerId(layer.id);
@@ -3517,81 +4157,47 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                         }}
                         title={
                           hasKfHere
-                            ? `حذف نقطة كي فريم عند فريم ${currentFrame}`
+                            ? `نقطة كي فريم عند فريم ${currentFrame}`
                             : `إضافة نقطة كي فريم (◇) عند فريم ${currentFrame} موضع هذا الخط بالضبط`
                         }
                       >
-                        <div className={`w-3.5 h-3.5 rotate-45 flex items-center justify-center transition-all shadow-md ${
+                        <div className={`w-2.5 h-2.5 rotate-45 flex items-center justify-center transition-all ${
                           hasKfHere
-                            ? 'bg-amber-400 border border-amber-100 ring-2 ring-amber-500/50 scale-110'
-                            : 'bg-slate-900/90 border-2 border-cyan-400 hover:bg-cyan-500 hover:border-cyan-300 hover:scale-125'
+                            ? `${
+                                layer.animatingRotation && layer.rotationKeyframes.some(k => k.frame === currentFrame) ? 'bg-amber-400' :
+                                layer.animatingPosition && layer.positionKeyframes.some(k => k.frame === currentFrame) ? 'bg-emerald-400' :
+                                layer.animatingScale && layer.scaleKeyframes.some(k => k.frame === currentFrame) ? 'bg-cyan-400' :
+                                layer.animatingOpacity && layer.opacityKeyframes.some(k => k.frame === currentFrame) ? 'bg-purple-400' :
+                                'bg-amber-400'
+                              } border border-slate-900 shadow-md`
+                            : 'bg-slate-900/90 border border-cyan-400 hover:bg-cyan-500'
                         }`}>
                           {!hasKfHere && (
-                            <span className="text-[9px] font-black text-cyan-300 -rotate-45 leading-none select-none">+</span>
+                            <span className="text-[7px] font-black text-cyan-300 -rotate-45 leading-none select-none">+</span>
                           )}
                         </div>
                       </div>
                     )}
 
                     {/* Keyframes for Position */}
-                    {layer.animatingPosition && layer.positionKeyframes.map((kf, i) => (
-                      <div
-                        key={`pos-${i}`}
-                        style={{ left: `${(kf.frame / compSettings.totalFrames) * 100}%` }}
-                        title={`مفتاح موضع في فريم ${kf.frame} (${Math.round(kf.value.x)}, ${Math.round(kf.value.y)})`}
-                        className="absolute w-2.5 h-2.5 bg-emerald-400 rotate-45 -translate-x-1/2 z-10 border border-slate-900 shadow-md cursor-pointer hover:scale-125 transition-transform"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCurrentFrame(kf.frame);
-                          setSelectedLayerId(layer.id);
-                        }}
-                      />
-                    ))}
+                    {layer.animatingPosition && layer.positionKeyframes.map((kf, i) =>
+                      renderKeyframeDiamond(layer, 'position', kf, i, 'bg-emerald-400', 'موضع')
+                    )}
 
                     {/* Keyframes for Scale */}
-                    {layer.animatingScale && layer.scaleKeyframes.map((kf, i) => (
-                      <div
-                        key={`scale-${i}`}
-                        style={{ left: `${(kf.frame / compSettings.totalFrames) * 100}%` }}
-                        title={`مفتاح حجم في فريم ${kf.frame} (${kf.value}%)`}
-                        className="absolute w-2.5 h-2.5 bg-cyan-400 rotate-45 -translate-x-1/2 z-10 border border-slate-900 shadow-md cursor-pointer hover:scale-125 transition-transform"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCurrentFrame(kf.frame);
-                          setSelectedLayerId(layer.id);
-                        }}
-                      />
-                    ))}
+                    {layer.animatingScale && layer.scaleKeyframes.map((kf, i) =>
+                      renderKeyframeDiamond(layer, 'scale', kf, i, 'bg-cyan-400', 'حجم')
+                    )}
 
                     {/* Keyframes for Rotation */}
-                    {layer.animatingRotation && layer.rotationKeyframes.map((kf, i) => (
-                      <div
-                        key={`rot-${i}`}
-                        style={{ left: `${(kf.frame / compSettings.totalFrames) * 100}%` }}
-                        title={`مفتاح دوران في فريم ${kf.frame} (${kf.value}°)`}
-                        className="absolute w-2.5 h-2.5 bg-amber-400 rotate-45 -translate-x-1/2 z-10 border border-slate-900 shadow-md cursor-pointer hover:scale-125 transition-transform"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCurrentFrame(kf.frame);
-                          setSelectedLayerId(layer.id);
-                        }}
-                      />
-                    ))}
+                    {layer.animatingRotation && layer.rotationKeyframes.map((kf, i) =>
+                      renderKeyframeDiamond(layer, 'rotation', kf, i, 'bg-amber-400', 'دوران')
+                    )}
 
                     {/* Keyframes for Opacity */}
-                    {layer.animatingOpacity && layer.opacityKeyframes.map((kf, i) => (
-                      <div
-                        key={`op-${i}`}
-                        style={{ left: `${(kf.frame / compSettings.totalFrames) * 100}%` }}
-                        title={`مفتاح شفافية في فريم ${kf.frame} (${kf.value}%)`}
-                        className="absolute w-2.5 h-2.5 bg-purple-400 rotate-45 -translate-x-1/2 z-10 border border-slate-900 shadow-md cursor-pointer hover:scale-125 transition-transform"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCurrentFrame(kf.frame);
-                          setSelectedLayerId(layer.id);
-                        }}
-                      />
-                    ))}
+                    {layer.animatingOpacity && layer.opacityKeyframes.map((kf, i) =>
+                      renderKeyframeDiamond(layer, 'opacity', kf, i, 'bg-purple-400', 'شفافية')
+                    )}
                   </div>
                 );
               })}
@@ -3602,10 +4208,10 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
       {/* ----------------- MODAL: COMPOSITION SETTINGS (Ctrl+K) ----------------- */}
       {showCompSettingsModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/30">
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-12 sm:pt-16 p-4 bg-slate-950/50 overflow-y-auto">
           <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
+            initial={{ opacity: 0, scale: 0.95, y: -10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
             className="w-full max-w-xl"
           >
             {renderCompSettingsContent(false)}
@@ -3615,8 +4221,8 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
 
       {/* ----------------- MODAL: EXPORT ENGINE ----------------- */}
       {exportModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/50">
-          <div className="w-full max-w-md bg-slate-900/60 border border-slate-800/60 rounded-3xl shadow-2xl p-6 text-slate-200 flex flex-col gap-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70">
+          <div className="w-full max-w-md bg-slate-900/70 border border-slate-700/60 rounded-3xl shadow-2xl p-6 text-slate-200 flex flex-col gap-4">
             <div className="flex items-center justify-between border-b border-slate-800/60 pb-3">
               <div className="flex items-center gap-2 font-bold text-sm text-violet-300">
                 <Download size={16} />
@@ -3673,89 +4279,116 @@ export const AfterEffectsStudio: React.FC<AfterEffectsStudioProps> = ({ onOpenIn
                       <span className="text-[8px] font-normal opacity-80">تسلسل صور متتالية</span>
                     </button>
                   </div>
-                  <p className="text-[9px] text-slate-400 leading-tight">
-                    {svgaExportMode === 'pieces'
-                      ? '✨ وضع القطع العادي: يتم تصدير كل طبقة كعنصر مستقل شفاف وتطبيق مصفوفات التحريك والـ Keyframes عليه مباشرة (بدون رندر إطارات كاملة - حجم خفيف جداً وأداء عالي).'
-                      : '🎞️ وضع الرندر الكامل: يتم رندرة كل فريم كصورة كاملة مسبقة الحساب (يولد حجماً أكبر).'}
-                  </p>
                 </div>
 
-                {/* SVGA Option */}
-                <button
-                  onClick={exportAsSVGA}
-                  className="p-3 rounded-xl bg-slate-800/40 hover:bg-violet-600/20 border border-violet-500/40 hover:border-violet-500/70 flex items-center justify-between text-left transition-all group"
-                >
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-1.5">
-                      <span className="font-bold text-xs text-white">ملف SVGA 2.0</span>
-                      <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-violet-600/40 text-violet-300 border border-violet-500/50">
-                        {svgaExportMode === 'pieces' ? 'قطع عادي (Sprites)' : 'رندر فريمات'}
-                      </span>
-                    </div>
-                    <span className="text-[10px] text-slate-400 mt-0.5">
-                      {svgaExportMode === 'pieces'
-                        ? 'تصدير كقطع مستقلة مع مصفوفات الحركة ومحاور التحريك (موصى به)'
-                        : 'تصدير كرندر تسلسلي لجميع الفريمات'}
-                    </span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-violet-600/30 text-violet-300 text-[10px] font-mono font-bold border border-violet-500/40 group-hover:bg-violet-600 group-hover:text-white transition-all">
-                    .SVGA
-                  </span>
-                </button>
-
-                {/* APNG Option */}
-                <button
-                  onClick={exportAsAPNG}
-                  className="p-3 rounded-xl bg-slate-800/40 hover:bg-emerald-600/20 border border-slate-700/60 hover:border-emerald-500/50 flex items-center justify-between text-left transition-all"
-                >
-                  <div className="flex flex-col">
-                    <span className="font-bold text-xs text-white">صورة APNG متحركة وشفافة</span>
-                    <span className="text-[10px] text-slate-400">أعلى دقة 24-bit مع شفافية ألفا نقية</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-emerald-600/30 text-emerald-300 text-[10px] font-mono font-bold border border-emerald-500/40">
-                    .PNG
-                  </span>
-                </button>
-
-                {/* GIF Option */}
-                <button
-                  onClick={exportAsGIF}
-                  className="p-3 rounded-xl bg-slate-800/40 hover:bg-amber-600/20 border border-slate-700/60 hover:border-amber-500/50 flex items-center justify-between text-left transition-all"
-                >
-                  <div className="flex flex-col">
-                    <span className="font-bold text-xs text-white">صورة GIF متحركة شفافة</span>
-                    <span className="text-[10px] text-slate-400">متوافقة مع كافة المواقع وتطبيقات الويب</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-amber-600/30 text-amber-300 text-[10px] font-mono font-bold border border-amber-500/40">
-                    .GIF
-                  </span>
-                </button>
-
-                {/* After Effects Script Option */}
-                <button
-                  onClick={exportAsAEJSX}
-                  className="p-3 rounded-xl bg-slate-800/40 hover:bg-blue-600/20 border border-slate-700/60 hover:border-blue-500/50 flex items-center justify-between text-left transition-all"
-                >
-                  <div className="flex flex-col">
-                    <span className="font-bold text-xs text-white">سكربت Adobe After Effects (.jsx)</span>
-                    <span className="text-[10px] text-slate-400">لفتح الكومبوزيشن والطبقات مباشرة داخل برنامج AE الحقيقي</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-blue-600/30 text-blue-300 text-[10px] font-mono font-bold border border-blue-500/40">
-                    .JSX
-                  </span>
-                </button>
-
-                {lastExportedSVGA && onOpenInViewer && (
+                {/* Format Category Switcher */}
+                <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-900/60 border border-slate-700/60">
                   <button
-                    onClick={() => {
-                      onOpenInViewer(lastExportedSVGA);
-                      setExportModalOpen(false);
-                    }}
-                    className="mt-2 w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all flex items-center justify-center gap-2"
+                    type="button"
+                    onClick={() => setExportCategory('primary')}
+                    className={`py-2 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center ${
+                      exportCategory === 'primary'
+                        ? 'bg-violet-600 text-white shadow-md shadow-violet-600/30'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                    }`}
                   >
-                    <Eye size={14} />
-                    <span>معاينة ملف الـ SVGA المصدّر في العارض مباشرة</span>
+                    <span>صيغ أساسية</span>
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setExportCategory('secondary')}
+                    className={`py-2 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center ${
+                      exportCategory === 'secondary'
+                        ? 'bg-violet-600 text-white shadow-md shadow-violet-600/30'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                    }`}
+                  >
+                    <span>صيغ جانبية</span>
+                  </button>
+                </div>
+
+                {exportCategory === 'primary' ? (
+                  <div className="flex flex-col gap-2.5">
+                    {/* SVGA Option */}
+                    <button
+                      onClick={exportAsSVGA}
+                      className="p-3 rounded-xl bg-slate-800/40 hover:bg-violet-600/20 border border-violet-500/40 hover:border-violet-500/70 flex items-center justify-between text-left transition-all group"
+                    >
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-bold text-xs text-white">ملف SVGA 2.0</span>
+                          <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-violet-600/40 text-violet-300 border border-violet-500/50">
+                            {svgaExportMode === 'pieces' ? 'قطع عادي (Sprites)' : 'رندر فريمات'}
+                          </span>
+                        </div>
+                        <span className="text-[10px] text-slate-400 mt-0.5">
+                          {svgaExportMode === 'pieces'
+                            ? 'تصدير كقطع مستقلة مع مصفوفات الحركة ومحاور التحريك (موصى به)'
+                            : 'تصدير كرندر تسلسلي لجميع الفريمات'}
+                        </span>
+                      </div>
+                      <span className="px-2 py-0.5 rounded bg-violet-600/30 text-violet-300 text-[10px] font-mono font-bold border border-violet-500/40 group-hover:bg-violet-600 group-hover:text-white transition-all">
+                        .SVGA
+                      </span>
+                    </button>
+
+                    {lastExportedSVGA && onOpenInViewer && (
+                      <button
+                        onClick={() => {
+                          onOpenInViewer(lastExportedSVGA);
+                          setExportModalOpen(false);
+                        }}
+                        className="mt-1 w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-lg shadow-emerald-900/30"
+                      >
+                        <Eye size={14} />
+                        <span>معاينة ملف الـ SVGA المصدّر في العارض مباشرة</span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2.5">
+                    {/* APNG Option */}
+                    <button
+                      onClick={exportAsAPNG}
+                      className="p-3 rounded-xl bg-slate-800/40 hover:bg-emerald-600/20 border border-slate-700/60 hover:border-emerald-500/50 flex items-center justify-between text-left transition-all group"
+                    >
+                      <div className="flex flex-col">
+                        <span className="font-bold text-xs text-white">صورة APNG متحركة وشفافة</span>
+                        <span className="text-[10px] text-slate-400">أعلى دقة 24-bit مع شفافية ألفا نقية</span>
+                      </div>
+                      <span className="px-2 py-0.5 rounded bg-emerald-600/30 text-emerald-300 text-[10px] font-mono font-bold border border-emerald-500/40 group-hover:bg-emerald-600 group-hover:text-white transition-all">
+                        .PNG
+                      </span>
+                    </button>
+
+                    {/* GIF Option */}
+                    <button
+                      onClick={exportAsGIF}
+                      className="p-3 rounded-xl bg-slate-800/40 hover:bg-amber-600/20 border border-slate-700/60 hover:border-amber-500/50 flex items-center justify-between text-left transition-all group"
+                    >
+                      <div className="flex flex-col">
+                        <span className="font-bold text-xs text-white">صورة GIF متحركة شفافة</span>
+                        <span className="text-[10px] text-slate-400">متوافقة مع كافة المواقع وتطبيقات الويب</span>
+                      </div>
+                      <span className="px-2 py-0.5 rounded bg-amber-600/30 text-amber-300 text-[10px] font-mono font-bold border border-amber-500/40 group-hover:bg-amber-600 group-hover:text-white transition-all">
+                        .GIF
+                      </span>
+                    </button>
+
+                    {/* After Effects Script Option */}
+                    <button
+                      onClick={exportAsAEJSX}
+                      className="p-3 rounded-xl bg-slate-800/40 hover:bg-blue-600/20 border border-slate-700/60 hover:border-blue-500/50 flex items-center justify-between text-left transition-all group"
+                    >
+                      <div className="flex flex-col">
+                        <span className="font-bold text-xs text-white">سكربت Adobe After Effects (.jsx)</span>
+                        <span className="text-[10px] text-slate-400">لفتح الكومبوزيشن والطبقات مباشرة داخل برنامج AE الحقيقي</span>
+                      </div>
+                      <span className="px-2 py-0.5 rounded bg-blue-600/30 text-blue-300 text-[10px] font-mono font-bold border border-blue-500/40 group-hover:bg-blue-600 group-hover:text-white transition-all">
+                        .JSX
+                      </span>
+                    </button>
+                  </div>
                 )}
               </div>
             )}
