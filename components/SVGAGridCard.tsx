@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { X, Loader2, AlertCircle, Check, Pencil } from 'lucide-react';
+import { X, Loader2, AlertCircle, Check, Pencil, SlidersHorizontal } from 'lucide-react';
 import pako from 'pako';
 import { parse } from 'protobufjs';
 import { svgaSchema } from '../svga-proto';
@@ -11,6 +11,7 @@ interface SVGAGridCardProps {
   isSelected?: boolean;
   onToggleSelect?: () => void;
   onRename?: (newName: string) => void;
+  onOpenEditor?: () => void;
 }
 
 export const SVGAGridCard: React.FC<SVGAGridCardProps> = ({
@@ -19,6 +20,7 @@ export const SVGAGridCard: React.FC<SVGAGridCardProps> = ({
   isSelected = false,
   onToggleSelect,
   onRename,
+  onOpenEditor,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
@@ -249,6 +251,20 @@ export const SVGAGridCard: React.FC<SVGAGridCardProps> = ({
         </button>
 
         <div className="flex items-center gap-1.5">
+          {/* Edit / Open in Editor Button */}
+          {onOpenEditor && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenEditor();
+              }}
+              className="w-7 h-7 rounded-xl bg-slate-950/50 hover:bg-blue-600/30 border border-white/10 hover:border-blue-500/40 text-slate-400 hover:text-blue-300 flex items-center justify-center transition-all opacity-0 group-hover:opacity-100"
+              title="فتح في محرر التعديل والمكتبة"
+            >
+              <SlidersHorizontal size={12} />
+            </button>
+          )}
+
           {/* Dimension Tag */}
           {meta && (
             <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-lg bg-slate-950/50 border border-white/10 text-slate-400">

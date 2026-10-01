@@ -16,6 +16,7 @@ interface SVGAGridViewerProps {
   onAddFiles: (files: File[]) => void;
   onRemoveFile: (file: SVGAFileExtended) => void;
   onRenameFile?: (file: SVGAFileExtended, newName: string) => void;
+  onOpenEditor?: (file: SVGAFileExtended) => void;
   onClearAll: () => void;
 }
 
@@ -24,6 +25,7 @@ export const SVGAGridViewer: React.FC<SVGAGridViewerProps> = ({
   onAddFiles,
   onRemoveFile,
   onRenameFile,
+  onOpenEditor,
   onClearAll,
 }) => {
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
@@ -256,6 +258,7 @@ export const SVGAGridViewer: React.FC<SVGAGridViewerProps> = ({
             isSelected={selectedFileNames.has(file.name)}
             onToggleSelect={() => handleToggleSelect(file)}
             onRename={(newName) => handleRename(file, newName)}
+            onOpenEditor={() => onOpenEditor?.(file)}
           />
         ))}
 

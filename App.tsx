@@ -154,7 +154,7 @@ const AppContent: React.FC = () => {
   const [history, setHistory] = useState<SVGAFileExtended[]>([]);
   const [currentView, setCurrentView] = useState<ViewType>('viewer');
   const [vabInitialFile, setVabInitialFile] = useState<File | null>(null);
-  const [forceGridView, setForceGridView] = useState(false);
+  const [viewMode, setViewMode] = useState<'single' | 'group'>('single');
   const [showSubModal, setShowSubModal] = useState(false);
   const [modalConfig, setModalConfig] = useState<{
     isOpen: boolean;
@@ -325,7 +325,19 @@ const AppContent: React.FC = () => {
       rawFile: file
     }));
     
-    setCurrentFiles(prev => [...prev, ...newFilesInfo]);
+    setCurrentFiles(prev => {
+      const next = [...prev, ...newFilesInfo];
+      if (prev.length === 0) {
+        if (files.length === 1) {
+          setViewMode('single');
+        } else {
+          setViewMode('group');
+        }
+      } else {
+        setViewMode('group');
+      }
+      return next;
+    });
     
     if (user?.uid) {
       const saveAndReload = async () => {
@@ -443,6 +455,11 @@ const AppContent: React.FC = () => {
   const handleHistoryClick = (item: SVGAFileExtended) => {
     setCurrentFiles(prev => {
       if (prev.find(p => p.name === item.name)) return prev;
+      if (prev.length === 0) {
+        setViewMode('single');
+      } else {
+        setViewMode('group');
+      }
       return [...prev, item];
     });
   };
@@ -689,12 +706,28 @@ const AppContent: React.FC = () => {
                       </div>
                     </div>
                   </div>
+                ) : (currentFiles.length === 1 && viewMode === 'single') ? (
+                  <SVGAViewer
+                    file={currentFiles[0]}
+                    originalFile={currentFiles[0].rawFile}
+                    onClear={() => {
+                      setCurrentFiles([]);
+                      setViewMode('single');
+                    }}
+                  />
                 ) : (
                   <SVGAGridViewer
                     files={currentFiles}
-                    onAddFiles={handleFilesUpload}
+                    onAddFiles={(files) => {
+                      setViewMode('group');
+                      handleFilesUpload(files);
+                    }}
                     onRemoveFile={(file) => {
-                      setCurrentFiles(prev => prev.filter(f => f !== file));
+                      setCurrentFiles(prev => {
+                        const next = prev.filter(f => f !== file);
+                        if (next.length === 0) setViewMode('single');
+                        return next;
+                      });
                     }}
                     onRenameFile={(file, newName) => {
                       setCurrentFiles(prev => prev.map(f => {
@@ -717,8 +750,13 @@ const AppContent: React.FC = () => {
                         return f;
                       }));
                     }}
+                    onOpenEditor={(file) => {
+                      setCurrentFiles([file]);
+                      setViewMode('single');
+                    }}
                     onClearAll={() => {
                       setCurrentFiles([]);
+                      setViewMode('single');
                     }}
                   />
                 )}
